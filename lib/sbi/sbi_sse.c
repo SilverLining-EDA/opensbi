@@ -15,7 +15,6 @@
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_fifo.h>
 #include <sbi/sbi_hart.h>
-#include <sbi/sbi_hart_protection.h>
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_hsm.h>
 #include <sbi/sbi_ipi.h>
@@ -24,7 +23,6 @@
 #include <sbi/sbi_pmu.h>
 #include <sbi/sbi_sse.h>
 #include <sbi/sbi_scratch.h>
-#include <sbi/sbi_slist.h>
 #include <sbi/sbi_string.h>
 #include <sbi/sbi_trap.h>
 
@@ -41,11 +39,21 @@
 
 #define EVENT_IS_GLOBAL(__event_id) ((__event_id) & SBI_SSE_EVENT_GLOBAL_BIT)
 
+static const uint32_t supported_events[] = {
+	SBI_SSE_EVENT_LOCAL_RAS,
+	SBI_SSE_EVENT_LOCAL_DOUBLE_TRAP,
+	SBI_SSE_EVENT_GLOBAL_RAS,
+	SBI_SSE_EVENT_LOCAL_PMU,
+	SBI_SSE_EVENT_LOCAL_SOFTWARE,
+	SBI_SSE_EVENT_GLOBAL_SOFTWARE,
+};
+
+#define EVENT_COUNT array_size(supported_events)
+
 #define sse_event_invoke_cb(_event, _cb, ...)                                 \
 	{                                                                     \
-		const struct sbi_sse_cb_ops *__ops = _event->info->cb_ops;    \
-		if (__ops && __ops->_cb)                                      \
-			__ops->_cb(_event->event_id, ##__VA_ARGS__);          \
+		if (_event->cb_ops && _event->cb_ops->_cb)                    \
+			_event->cb_ops->_cb(_event->event_id, ##__VA_ARGS__); \
 	}
 
 struct sse_entry_state {
@@ -102,17 +110,12 @@ struct sbi_sse_event {
 	struct sbi_sse_event_attrs attrs;
 	uint32_t event_id;
 	u32 hartindex;
-	struct sse_event_info *info;
+	const struct sbi_sse_cb_ops *cb_ops;
 	struct sbi_dlist node;
 };
 
 /** Per-hart state */
 struct sse_hart_state {
-	/**
-	 * Lock that protects enabled_event_list
-	 */
-	spinlock_t enabled_event_lock;
-
 	/* Priority sorted list of enabled events (global and local in >=
 	 * ENABLED state). This list is protected by the enabled_event_lock.
 	 *
@@ -129,7 +132,12 @@ struct sse_hart_state {
 	 * this enabled_event_list and thus can only be removed from this
 	 * list upon disable ecall or on complete with ONESHOT flag.
 	 */
-	struct sbi_dlist enabled_event_list GUARDED_BY(&enabled_event_lock);
+	struct sbi_dlist enabled_event_list;
+
+	/**
+	 * Lock that protects enabled_event_list
+	 */
+	spinlock_t enabled_event_lock;
 
 	/**
 	 * List of local events allocated at boot time.
@@ -148,21 +156,15 @@ struct sse_hart_state {
  */
 struct sse_global_event {
 	/**
+	 * global event struct
+	 */
+	struct sbi_sse_event event;
+
+	/**
 	 * Global event lock protecting access from multiple harts from ecall to
 	 * the event.
 	 */
 	spinlock_t lock;
-
-	/**
-	 * global event struct
-	 */
-	struct sbi_sse_event event GUARDED_BY(&lock);
-};
-
-struct sse_event_info {
-	uint32_t event_id;
-	const struct sbi_sse_cb_ops *cb_ops;
-	SBI_SLIST_NODE(sse_event_info);
 };
 
 static unsigned int local_event_count;
@@ -177,58 +179,6 @@ static unsigned long shs_ptr_off;
 static u32 sse_ipi_inject_event = SBI_IPI_EVENT_MAX;
 
 static int sse_ipi_inject_send(unsigned long hartid, uint32_t event_id);
-
-struct sse_event_info global_software_event = {
-	.event_id = SBI_SSE_EVENT_GLOBAL_SOFTWARE,
-	SBI_SLIST_NODE_INIT(NULL),
-};
-
-struct sse_event_info local_software_event = {
-	.event_id = SBI_SSE_EVENT_LOCAL_SOFTWARE,
-	SBI_SLIST_NODE_INIT(&global_software_event),
-};
-
-static SBI_SLIST_HEAD(supported_events, sse_event_info) =
-				SBI_SLIST_HEAD_INIT(&local_software_event);
-
-/*
- * This array is used to distinguish between standard event and platform
- * events in order to return SBI_ERR_NOT_SUPPORTED for them.
- */
-static const uint32_t standard_events[] = {
-	SBI_SSE_EVENT_LOCAL_HIGH_PRIO_RAS,
-	SBI_SSE_EVENT_LOCAL_DOUBLE_TRAP,
-	SBI_SSE_EVENT_GLOBAL_HIGH_PRIO_RAS,
-	SBI_SSE_EVENT_LOCAL_PMU_OVERFLOW,
-	SBI_SSE_EVENT_LOCAL_LOW_PRIO_RAS,
-	SBI_SSE_EVENT_GLOBAL_LOW_PRIO_RAS,
-	SBI_SSE_EVENT_LOCAL_SOFTWARE,
-	SBI_SSE_EVENT_GLOBAL_SOFTWARE,
-};
-
-static bool sse_is_standard_event(uint32_t event_id)
-{
-	int i;
-
-	for (i = 0; i < array_size(standard_events); i++) {
-		if (event_id == standard_events[i])
-			return true;
-	}
-
-	return false;
-}
-
-static struct sse_event_info *sse_event_info_get(uint32_t event_id)
-{
-	struct sse_event_info *info;
-
-	SBI_SLIST_FOR_EACH_ENTRY(info, supported_events) {
-		if (info->event_id == event_id)
-			return info;
-	}
-
-	return NULL;
-}
 
 static unsigned long sse_event_state(struct sbi_sse_event *e)
 {
@@ -265,6 +215,28 @@ static struct sse_global_event *sse_get_global_event(struct sbi_sse_event *e)
 	return container_of(e, struct sse_global_event, event);
 }
 
+/**
+ * If event is global, must be called under enabled event lock
+ */
+static void sse_enabled_event_lock(struct sbi_sse_event *e)
+{
+	struct sse_hart_state *shs;
+
+	shs = sse_get_hart_state(e);
+	spin_lock(&shs->enabled_event_lock);
+}
+
+/**
+ * If event is global, must be called under enabled event lock
+ */
+static void sse_enabled_event_unlock(struct sbi_sse_event *e)
+{
+	struct sse_hart_state *shs;
+
+	shs = sse_get_hart_state(e);
+	spin_unlock(&shs->enabled_event_lock);
+}
+
 static void sse_event_set_state(struct sbi_sse_event *e,
 				unsigned long new_state)
 {
@@ -272,45 +244,33 @@ static void sse_event_set_state(struct sbi_sse_event *e,
 	e->attrs.status |= new_state;
 }
 
-static int sse_event_get(uint32_t event_id,
-			 struct sbi_sse_event **eret) NO_THREAD_SAFETY_ANALYSIS
+static struct sbi_sse_event *sse_event_get(uint32_t event_id)
 {
 	unsigned int i;
 	struct sbi_sse_event *e;
 	struct sse_hart_state *shs;
-
-	if (!eret)
-		return SBI_EINVAL;
 
 	if (EVENT_IS_GLOBAL(event_id)) {
 		for (i = 0; i < global_event_count; i++) {
 			e = &global_events[i].event;
 			if (e->event_id == event_id) {
 				spin_lock(&global_events[i].lock);
-				*eret = e;
-				return SBI_SUCCESS;
+				return e;
 			}
 		}
 	} else {
 		shs = sse_thishart_state_ptr();
 		for (i = 0; i < local_event_count; i++) {
 			e = &shs->local_events[i];
-			if (e->event_id == event_id) {
-				*eret = e;
-				return SBI_SUCCESS;
-			}
+			if (e->event_id == event_id)
+				return e;
 		}
 	}
 
-	/* Check if the event is a standard one but not supported */
-	if (sse_is_standard_event(event_id))
-		return SBI_ENOTSUPP;
-
-	/* If not supported nor a standard event, it is invalid */
-	return SBI_EINVAL;
+	return NULL;
 }
 
-static void sse_event_put(struct sbi_sse_event *e) NO_THREAD_SAFETY_ANALYSIS
+static void sse_event_put(struct sbi_sse_event *e)
 {
 	struct sse_global_event *ge;
 
@@ -329,10 +289,9 @@ static void sse_event_remove_from_list(struct sbi_sse_event *e)
 /**
  * Must be called under owner hart lock
  */
-static void sse_event_add_to_list(struct sse_hart_state *state,
-				   struct sbi_sse_event *e)
-	MUST_HOLD(&state->enabled_event_lock)
+static void sse_event_add_to_list(struct sbi_sse_event *e)
 {
+	struct sse_hart_state *state = sse_get_hart_state(e);
 	struct sbi_sse_event *tmp;
 
 	sbi_list_for_each_entry(tmp, &state->enabled_event_list, node) {
@@ -348,9 +307,7 @@ static void sse_event_add_to_list(struct sse_hart_state *state,
 /**
  * Must be called under owner hart lock
  */
-static int sse_event_disable(struct sse_hart_state *shs,
-			      struct sbi_sse_event *e)
-	MUST_HOLD(&shs->enabled_event_lock)
+static int sse_event_disable(struct sbi_sse_event *e)
 {
 	if (sse_event_state(e) != SBI_SSE_STATE_ENABLED)
 		return SBI_EINVALID_STATE;
@@ -371,7 +328,7 @@ static int sse_event_set_hart_id_check(struct sbi_sse_event *e,
 	struct sbi_domain *hd = sbi_domain_thishart_ptr();
 
 	if (!sse_event_is_global(e))
-		return SBI_EDENIED;
+		return SBI_EBAD_RANGE;
 
 	if (!sbi_domain_is_assigned_hart(hd, sbi_hartid_to_hartindex(hartid)))
 		return SBI_EINVAL;
@@ -410,12 +367,10 @@ static int sse_event_set_attr_check(struct sbi_sse_event *e, uint32_t attr_id,
 
 		return sse_event_set_hart_id_check(e, val);
 	case SBI_SSE_ATTR_INTERRUPTED_FLAGS:
-		if (val & ~(SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPP |
-			    SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPIE |
+		if (val & ~(SBI_SSE_ATTR_INTERRUPTED_FLAGS_STATUS_SPP |
+			    SBI_SSE_ATTR_INTERRUPTED_FLAGS_STATUS_SPIE |
 			    SBI_SSE_ATTR_INTERRUPTED_FLAGS_HSTATUS_SPV |
-			    SBI_SSE_ATTR_INTERRUPTED_FLAGS_HSTATUS_SPVP |
-			    SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPELP |
-			    SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SDT))
+			    SBI_SSE_ATTR_INTERRUPTED_FLAGS_HSTATUS_SPVP))
 			return SBI_EINVAL;
 		__attribute__((__fallthrough__));
 	case SBI_SSE_ATTR_INTERRUPTED_SEPC:
@@ -429,13 +384,7 @@ static int sse_event_set_attr_check(struct sbi_sse_event *e, uint32_t attr_id,
 
 		return SBI_OK;
 	default:
-		/*
-		 * Attribute range validity was already checked by
-		 * sbi_sse_attr_check(). If we end up here, attribute was not
-		 * handled by the above 'case' statements and thus it is
-		 * read-only.
-		 */
-		return SBI_EDENIED;
+		return SBI_EBAD_RANGE;
 	}
 }
 
@@ -503,14 +452,10 @@ static unsigned long sse_interrupted_flags(unsigned long mstatus)
 {
 	unsigned long hstatus, flags = 0;
 
-	if (mstatus & MSTATUS_SPIE)
-		flags |= SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPIE;
-	if (mstatus & MSTATUS_SPP)
-		flags |= SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPP;
-	if (mstatus & MSTATUS_SPELP)
-		flags |= SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPELP;
-	if (mstatus & MSTATUS_SDT)
-		flags |= SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SDT;
+	if (mstatus & (MSTATUS_SPIE))
+		flags |= SBI_SSE_ATTR_INTERRUPTED_FLAGS_STATUS_SPIE;
+	if (mstatus & (MSTATUS_SPP))
+		flags |= SBI_SSE_ATTR_INTERRUPTED_FLAGS_STATUS_SPP;
 
 	if (misa_extension('H')) {
 		hstatus = csr_read(CSR_HSTATUS);
@@ -530,7 +475,7 @@ static void sse_event_inject(struct sbi_sse_event *e,
 
 	sse_event_set_state(e, SBI_SSE_STATE_RUNNING);
 
-	e->attrs.status &= ~BIT(SBI_SSE_ATTR_STATUS_PENDING_OFFSET);
+	e->attrs.status = ~BIT(SBI_SSE_ATTR_STATUS_PENDING_OFFSET);
 
 	i_ctx->a6 = regs->a6;
 	i_ctx->a7 = regs->a7;
@@ -545,14 +490,19 @@ static void sse_event_inject(struct sbi_sse_event *e,
 
 	if (misa_extension('H')) {
 		unsigned long hstatus = csr_read(CSR_HSTATUS);
-		if (sbi_regs_from_virt(regs))
+
+#if __riscv_xlen == 64
+		if (regs->mstatus & MSTATUS_MPV)
+#elif __riscv_xlen == 32
+		if (regs->mstatusH & MSTATUSH_MPV)
+#else
+#error "Unexpected __riscv_xlen"
+#endif
 			hstatus |= HSTATUS_SPV;
-		else
-			hstatus &= ~HSTATUS_SPV;
 
 		hstatus &= ~HSTATUS_SPVP;
 		if (hstatus & HSTATUS_SPV && regs->mstatus & SSTATUS_SPP)
-			hstatus |= HSTATUS_SPVP;
+				hstatus |= HSTATUS_SPVP;
 
 		csr_write(CSR_HSTATUS, hstatus);
 	}
@@ -563,13 +513,9 @@ static void sse_event_inject(struct sbi_sse_event *e,
 	regs->a7 = e->attrs.entry.arg;
 	regs->mepc = e->attrs.entry.pc;
 
-	/*
-	 * Return to S-mode with virtualization disabled, not expected landing
-	 * pad, supervisor trap disabled.
-	 */
-	regs->mstatus &= ~(MSTATUS_MPP | MSTATUS_SIE | MSTATUS_SPELP);
+	/* Return to S-mode with virtualization disabled */
+	regs->mstatus &= ~(MSTATUS_MPP | MSTATUS_SIE);
 	regs->mstatus |= (PRV_S << MSTATUS_MPP_SHIFT);
-	regs->mstatus |= MSTATUS_SDT;
 
 #if __riscv_xlen == 64
 	regs->mstatus &= ~MSTATUS_MPV;
@@ -620,20 +566,12 @@ static void sse_event_resume(struct sbi_sse_event *e,
 		regs->mstatus |= MSTATUS_SIE;
 
 	regs->mstatus &= ~MSTATUS_SPIE;
-	if (i_ctx->flags & SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPIE)
+	if (i_ctx->flags & SBI_SSE_ATTR_INTERRUPTED_FLAGS_STATUS_SPIE)
 		regs->mstatus |= MSTATUS_SPIE;
 
 	regs->mstatus &= ~MSTATUS_SPP;
-	if (i_ctx->flags & SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPP)
+	if (i_ctx->flags & SBI_SSE_ATTR_INTERRUPTED_FLAGS_STATUS_SPP)
 		regs->mstatus |= MSTATUS_SPP;
-
-	regs->mstatus &= ~MSTATUS_SPELP;
-	if (i_ctx->flags & SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SPELP)
-		regs->mstatus |= MSTATUS_SPELP;
-
-	regs->mstatus &= ~MSTATUS_SDT;
-	if (i_ctx->flags & SBI_SSE_ATTR_INTERRUPTED_FLAGS_SSTATUS_SDT)
-		regs->mstatus |= MSTATUS_SDT;
 
 	regs->a7 = i_ctx->a7;
 	regs->a6 = i_ctx->a6;
@@ -715,7 +653,8 @@ static void sse_ipi_inject_process(struct sbi_scratch *scratch)
 
 	/* Mark all queued events as pending */
 	while (!sbi_fifo_dequeue(sse_inject_fifo_r, &evt)) {
-		if (sse_event_get(evt.event_id, &e))
+		e = sse_event_get(evt.event_id);
+		if (!e)
 			continue;
 
 		sse_event_set_pending(e);
@@ -757,9 +696,10 @@ static int sse_inject_event(uint32_t event_id, unsigned long hartid)
 	int ret;
 	struct sbi_sse_event *e;
 
-	ret = sse_event_get(event_id, &e);
-	if (ret)
-		return ret;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
+
 
 	/* In case of global event, provided hart_id is ignored */
 	if (sse_event_is_global(e))
@@ -782,15 +722,13 @@ static int sse_inject_event(uint32_t event_id, unsigned long hartid)
 /**
  * Must be called under owner hart lock
  */
-static int sse_event_enable(struct sse_hart_state *shs,
-			     struct sbi_sse_event *e)
-	MUST_HOLD(&shs->enabled_event_lock)
+static int sse_event_enable(struct sbi_sse_event *e)
 {
 	if (sse_event_state(e) != SBI_SSE_STATE_REGISTERED)
 		return SBI_EINVALID_STATE;
 
 	sse_event_set_state(e, SBI_SSE_STATE_ENABLED);
-	sse_event_add_to_list(shs, e);
+	sse_event_add_to_list(e);
 
 	sse_event_invoke_cb(e, enable_cb);
 
@@ -801,11 +739,9 @@ static int sse_event_enable(struct sse_hart_state *shs,
 	return SBI_OK;
 }
 
-static int sse_event_complete(struct sse_hart_state *shs,
-			      struct sbi_sse_event *e,
+static int sse_event_complete(struct sbi_sse_event *e,
 			      struct sbi_trap_regs *regs,
 			      struct sbi_ecall_return *out)
-	MUST_HOLD(&shs->enabled_event_lock)
 {
 	if (sse_event_state(e) != SBI_SSE_STATE_RUNNING)
 		return SBI_EINVALID_STATE;
@@ -815,7 +751,7 @@ static int sse_event_complete(struct sse_hart_state *shs,
 
 	sse_event_set_state(e, SBI_SSE_STATE_ENABLED);
 	if (e->attrs.config & SBI_SSE_ATTR_CONFIG_ONESHOT)
-		sse_event_disable(shs, e);
+		sse_event_disable(e);
 
 	sse_event_invoke_cb(e, complete_cb);
 
@@ -838,7 +774,7 @@ int sbi_sse_complete(struct sbi_trap_regs *regs, struct sbi_ecall_return *out)
 		 * the one that needs to be completed
 		 */
 		if (sse_event_state(tmp) == SBI_SSE_STATE_RUNNING) {
-			ret = sse_event_complete(state, tmp, regs, out);
+			ret = sse_event_complete(tmp, regs, out);
 			break;
 		}
 	}
@@ -851,16 +787,14 @@ int sbi_sse_enable(uint32_t event_id)
 {
 	int ret;
 	struct sbi_sse_event *e;
-	struct sse_hart_state *shs;
 
-	ret = sse_event_get(event_id, &e);
-	if (ret)
-		return ret;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
 
-	shs = sse_get_hart_state(e);
-	spin_lock(&shs->enabled_event_lock);
-	ret = sse_event_enable(shs, e);
-	spin_unlock(&shs->enabled_event_lock);
+	sse_enabled_event_lock(e);
+	ret = sse_event_enable(e);
+	sse_enabled_event_unlock(e);
 	sse_event_put(e);
 
 	return ret;
@@ -870,16 +804,14 @@ int sbi_sse_disable(uint32_t event_id)
 {
 	int ret;
 	struct sbi_sse_event *e;
-	struct sse_hart_state *shs;
 
-	ret = sse_event_get(event_id, &e);
-	if (ret)
-		return ret;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
 
-	shs = sse_get_hart_state(e);
-	spin_lock(&shs->enabled_event_lock);
-	ret = sse_event_disable(shs, e);
-	spin_unlock(&shs->enabled_event_lock);
+	sse_enabled_event_lock(e);
+	ret = sse_event_disable(e);
+	sse_enabled_event_unlock(e);
 
 	sse_event_put(e);
 
@@ -894,7 +826,7 @@ int sbi_sse_hart_mask(void)
 		return SBI_EFAIL;
 
 	if (state->masked)
-		return SBI_EALREADY_STOPPED;
+		return SBI_EALREADY_STARTED;
 
 	state->masked = true;
 
@@ -909,7 +841,7 @@ int sbi_sse_hart_unmask(void)
 		return SBI_EFAIL;
 
 	if (!state->masked)
-		return SBI_EALREADY_STARTED;
+		return SBI_EALREADY_STOPPED;
 
 	state->masked = false;
 
@@ -931,26 +863,19 @@ int sbi_sse_inject_event(uint32_t event_id)
 	return sse_inject_event(event_id, current_hartid());
 }
 
-int sbi_sse_add_event(uint32_t event_id, const struct sbi_sse_cb_ops *cb_ops)
+int sbi_sse_set_cb_ops(uint32_t event_id, const struct sbi_sse_cb_ops *cb_ops)
 {
-	struct sse_event_info *info;
+	struct sbi_sse_event *e;
 
-	/* Do not allow adding an event twice */
-	info = sse_event_info_get(event_id);
-	if (info)
-		return SBI_EALREADY;
-
-	if (cb_ops && cb_ops->set_hartid_cb && !EVENT_IS_GLOBAL(event_id))
+	if (cb_ops->set_hartid_cb && !EVENT_IS_GLOBAL(event_id))
 		return SBI_EINVAL;
 
-	info = sbi_zalloc(sizeof(*info));
-	if (!info)
-		return SBI_ENOMEM;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
 
-	info->cb_ops = cb_ops;
-	info->event_id = event_id;
-
-	SBI_SLIST_ADD(info, supported_events);
+	e->cb_ops = cb_ops;
+	sse_event_put(e);
 
 	return SBI_OK;
 }
@@ -1018,11 +943,11 @@ int sbi_sse_read_attrs(uint32_t event_id, uint32_t base_attr_id,
 	if (ret)
 		return ret;
 
-	ret = sse_event_get(event_id, &e);
-	if (ret)
-		return ret;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
 
-	sbi_hart_protection_temp_map_range(output_phys_lo, sizeof(unsigned long) * attr_count);
+	sbi_hart_map_saddr(output_phys_lo, sizeof(unsigned long) * attr_count);
 
 	/*
 	 * Copy all attributes at once since struct sse_event_attrs is matching
@@ -1035,7 +960,7 @@ int sbi_sse_read_attrs(uint32_t event_id, uint32_t base_attr_id,
 	attrs = (unsigned long *)output_phys_lo;
 	copy_attrs(attrs, &e_attrs[base_attr_id], attr_count);
 
-	sbi_hart_protection_temp_unmap_range(output_phys_lo, sizeof(unsigned long) * attr_count);
+	sbi_hart_unmap_saddr();
 
 	sse_event_put(e);
 
@@ -1050,7 +975,7 @@ static int sse_write_attrs(struct sbi_sse_event *e, uint32_t base_attr_id,
 	uint32_t id, end_id = base_attr_id + attr_count;
 	unsigned long *attrs = (unsigned long *)input_phys;
 
-	sbi_hart_protection_temp_map_range(input_phys, sizeof(unsigned long) * attr_count);
+	sbi_hart_map_saddr(input_phys, sizeof(unsigned long) * attr_count);
 
 	for (id = base_attr_id; id < end_id; id++) {
 		val = attrs[attr++];
@@ -1066,7 +991,7 @@ static int sse_write_attrs(struct sbi_sse_event *e, uint32_t base_attr_id,
 	}
 
 out:
-	sbi_hart_protection_temp_unmap_range(input_phys, sizeof(unsigned long) * attr_count);
+	sbi_hart_unmap_saddr();
 
 	return ret;
 }
@@ -1083,9 +1008,9 @@ int sbi_sse_write_attrs(uint32_t event_id, uint32_t base_attr_id,
 	if (ret)
 		return ret;
 
-	ret = sse_event_get(event_id, &e);
-	if (ret)
-		return ret;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
 
 	ret = sse_write_attrs(e, base_attr_id, attr_count, input_phys_lo);
 	sse_event_put(e);
@@ -1108,9 +1033,9 @@ int sbi_sse_register(uint32_t event_id, unsigned long handler_entry_pc,
 					 SBI_DOMAIN_EXECUTE))
 		return SBI_EINVALID_ADDR;
 
-	ret = sse_event_get(event_id, &e);
-	if (ret)
-		return ret;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
 
 	ret = sse_event_register(e, handler_entry_pc, handler_entry_arg);
 	sse_event_put(e);
@@ -1123,9 +1048,9 @@ int sbi_sse_unregister(uint32_t event_id)
 	int ret;
 	struct sbi_sse_event *e;
 
-	ret = sse_event_get(event_id, &e);
-	if (ret)
-		return ret;
+	e = sse_event_get(event_id);
+	if (!e)
+		return SBI_EINVAL;
 
 	ret = sse_event_unregister(e);
 	sse_event_put(e);
@@ -1133,10 +1058,9 @@ int sbi_sse_unregister(uint32_t event_id)
 	return ret;
 }
 
-static void sse_event_init(struct sbi_sse_event *e, struct sse_event_info *info)
+static void sse_event_init(struct sbi_sse_event *e, uint32_t event_id)
 {
-	e->event_id = info->event_id;
-	e->info = info;
+	e->event_id = event_id;
 	e->hartindex = current_hartindex();
 	e->attrs.hartid = current_hartid();
 	/* Declare all events as injectable */
@@ -1145,10 +1069,10 @@ static void sse_event_init(struct sbi_sse_event *e, struct sse_event_info *info)
 
 static void sse_event_count_init()
 {
-	struct sse_event_info *info;
+	unsigned int i;
 
-	SBI_SLIST_FOR_EACH_ENTRY(info, supported_events) {
-		if (EVENT_IS_GLOBAL(info->event_id))
+	for (i = 0; i < EVENT_COUNT; i++) {
+		if (EVENT_IS_GLOBAL(supported_events[i]))
 			global_event_count++;
 		else
 			local_event_count++;
@@ -1158,19 +1082,18 @@ static void sse_event_count_init()
 static int sse_global_init()
 {
 	struct sbi_sse_event *e;
-	unsigned int ev = 0;
-	struct sse_event_info *info;
+	unsigned int i, ev = 0;
 
 	global_events = sbi_zalloc(sizeof(*global_events) * global_event_count);
 	if (!global_events)
 		return SBI_ENOMEM;
 
-	SBI_SLIST_FOR_EACH_ENTRY(info, supported_events) {
-		if (!EVENT_IS_GLOBAL(info->event_id))
+	for (i = 0; i < EVENT_COUNT; i++) {
+		if (!EVENT_IS_GLOBAL(supported_events[i]))
 			continue;
 
 		e = &global_events[ev].event;
-		sse_event_init(e, info);
+		sse_event_init(e, supported_events[i]);
 		SPIN_LOCK_INIT(global_events[ev].lock);
 
 		ev++;
@@ -1180,18 +1103,17 @@ static int sse_global_init()
 }
 
 static void sse_local_init(struct sse_hart_state *shs)
-	NO_THREAD_SAFETY_ANALYSIS
 {
-	unsigned int ev = 0;
-	struct sse_event_info *info;
+	unsigned int i, ev = 0;
 
 	SBI_INIT_LIST_HEAD(&shs->enabled_event_list);
 	SPIN_LOCK_INIT(shs->enabled_event_lock);
 
-	SBI_SLIST_FOR_EACH_ENTRY(info, supported_events) {
-		if (EVENT_IS_GLOBAL(info->event_id))
+	for (i = 0; i < EVENT_COUNT; i++) {
+		if (EVENT_IS_GLOBAL(supported_events[i]))
 			continue;
-		sse_event_init(&shs->local_events[ev++], info);
+
+		sse_event_init(&shs->local_events[ev++], supported_events[i]);
 	}
 }
 
@@ -1221,8 +1143,7 @@ int sbi_sse_init(struct sbi_scratch *scratch, bool cold_boot)
 		}
 
 		sse_inject_fifo_mem_off = sbi_scratch_alloc_offset(
-			(global_event_count + local_event_count) *
-			sizeof(struct sse_ipi_inject_data));
+			EVENT_COUNT * sizeof(struct sse_ipi_inject_data));
 		if (!sse_inject_fifo_mem_off) {
 			sbi_scratch_free_offset(sse_inject_fifo_off);
 			sbi_scratch_free_offset(shs_ptr_off);
@@ -1259,8 +1180,7 @@ int sbi_sse_init(struct sbi_scratch *scratch, bool cold_boot)
 	sse_inject_mem =
 		sbi_scratch_offset_ptr(scratch, sse_inject_fifo_mem_off);
 
-	sbi_fifo_init(sse_inject_q, sse_inject_mem,
-		      (global_event_count + local_event_count),
+	sbi_fifo_init(sse_inject_q, sse_inject_mem, EVENT_COUNT,
 		      sizeof(struct sse_ipi_inject_data));
 
 	return 0;
@@ -1268,18 +1188,21 @@ int sbi_sse_init(struct sbi_scratch *scratch, bool cold_boot)
 
 void sbi_sse_exit(struct sbi_scratch *scratch)
 {
+	int i;
 	struct sbi_sse_event *e;
-	struct sse_event_info *info;
 
-	SBI_SLIST_FOR_EACH_ENTRY(info, supported_events) {
-		if (sse_event_get(info->event_id, &e))
+	for (i = 0; i < EVENT_COUNT; i++) {
+		e = sse_event_get(supported_events[i]);
+		if (!e)
 			continue;
 
 		if (e->attrs.hartid != current_hartid())
 			goto skip;
 
-		if (sse_event_state(e) > SBI_SSE_STATE_REGISTERED)
+		if (sse_event_state(e) > SBI_SSE_STATE_REGISTERED) {
+			sbi_printf("Event %d in invalid state at exit", i);
 			sse_event_set_state(e, SBI_SSE_STATE_UNUSED);
+		}
 
 skip:
 		sse_event_put(e);

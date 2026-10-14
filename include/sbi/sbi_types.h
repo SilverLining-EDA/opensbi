@@ -14,7 +14,7 @@
 
 /* clang-format off */
 
-typedef signed char		s8;
+typedef char			s8;
 typedef unsigned char		u8;
 typedef unsigned char		uint8_t;
 
@@ -95,13 +95,6 @@ typedef uint64_t		be64_t;
 #define container_of(ptr, type, member) ({			\
 	const typeof(((type *)0)->member) * __mptr = (ptr);	\
 	(type *)((char *)__mptr - offsetof(type, member)); })
-
-
-#define assert_member_offset(type, member, offset)			\
-	_Static_assert(							\
-		(offsetof(type, member)) == (offset ),			\
-		"The offset " #offset " of " #member " in " #type	\
-		"is not correct, please redefine it.")
 
 #define array_size(x) 	(sizeof(x) / sizeof((x)[0]))
 

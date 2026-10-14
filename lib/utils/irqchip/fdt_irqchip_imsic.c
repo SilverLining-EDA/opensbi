@@ -92,7 +92,7 @@ static const struct fdt_match irqchip_imsic_match[] = {
 	{ },
 };
 
-const struct fdt_driver fdt_irqchip_imsic = {
+struct fdt_irqchip fdt_irqchip_imsic = {
 	.match_table = irqchip_imsic_match,
-	.init = irqchip_imsic_cold_init,
+	.cold_init = irqchip_imsic_cold_init,
 };

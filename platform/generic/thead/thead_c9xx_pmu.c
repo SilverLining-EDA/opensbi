@@ -53,7 +53,7 @@ static void thead_c9xx_pmu_ctr_disable_irq(uint32_t ctr_idx)
 
 static int thead_c9xx_pmu_irq_bit(void)
 {
-	return THEAD_C9XX_IRQ_PMU_OVF;
+	return THEAD_C9XX_MIP_MOIP;
 }
 
 static const struct sbi_pmu_device thead_c9xx_pmu_device = {

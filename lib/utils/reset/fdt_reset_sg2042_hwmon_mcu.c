@@ -10,8 +10,8 @@
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_system.h>
 #include <sbi/sbi_console.h>
-#include <sbi_utils/fdt/fdt_driver.h>
 #include <sbi_utils/fdt/fdt_helper.h>
+#include <sbi_utils/reset/fdt_reset.h>
 #include <sbi_utils/i2c/fdt_i2c.h>
 
 #define MANGO_BOARD_TYPE_MASK		0x80
@@ -104,7 +104,7 @@ static int sg2042_mcu_reset_init(const void *fdt, int nodeoff,
 }
 
 static const struct fdt_match sg2042_mcu_reset_match[] = {
-	{ .compatible = "sophgo,sg2042-hwmon-mcu" },
+	{ .compatible = "sophgo,sg2042-hwmon-mcu", .data = (void *)true},
 	{ },
 };
 

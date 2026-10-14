@@ -94,26 +94,20 @@ OPENSBI_VERSION_MINOR=`grep "define OPENSBI_VERSION_MINOR" $(include_dir)/sbi/sb
 OPENSBI_VERSION_GIT=
 
 # Detect 'git' presence before issuing 'git' commands
-GIT_AVAIL := $(shell command -v git 2> /dev/null)
+GIT_AVAIL=$(shell command -v git 2> /dev/null)
 ifneq ($(GIT_AVAIL),)
-GIT_DIR := $(shell git rev-parse --git-dir 2> /dev/null)
+GIT_DIR=$(shell git rev-parse --git-dir 2> /dev/null)
 ifneq ($(GIT_DIR),)
-OPENSBI_VERSION_GIT := $(shell if [ -d $(GIT_DIR) ]; then git describe 2> /dev/null; fi)
+OPENSBI_VERSION_GIT=$(shell if [ -d $(GIT_DIR) ]; then git describe 2> /dev/null; fi)
 endif
 endif
 
 # Setup compilation commands
 ifneq ($(LLVM),)
-ifneq ($(filter %/,$(LLVM)),)
-LLVM_PREFIX := $(LLVM)
-else ifneq ($(filter -%,$(LLVM)),)
-LLVM_SUFFIX := $(LLVM)
-endif
-
-CC		=	$(LLVM_PREFIX)clang$(LLVM_SUFFIX)
-AR		=	$(LLVM_PREFIX)llvm-ar$(LLVM_SUFFIX)
-LD		=	$(LLVM_PREFIX)ld.lld$(LLVM_SUFFIX)
-OBJCOPY		=	$(LLVM_PREFIX)llvm-objcopy$(LLVM_SUFFIX)
+CC		=	clang
+AR		=	llvm-ar
+LD		=	ld.lld
+OBJCOPY		=	llvm-objcopy
 else
 ifdef CROSS_COMPILE
 CC		=	$(CROSS_COMPILE)gcc
@@ -151,12 +145,6 @@ endif
 
 # Guess the compiler's XLEN
 OPENSBI_CC_XLEN := $(shell TMP=`$(CC) $(CLANG_TARGET) -dumpmachine | sed 's/riscv\([0-9][0-9]\).*/\1/'`; echo $${TMP})
-# If guessing XLEN fails, default to 64
-ifneq ($(OPENSBI_CC_XLEN),32)
-  ifneq ($(OPENSBI_CC_XLEN),64)
-    OPENSBI_CC_XLEN = 64
-  endif
-endif
 
 # Guess the compiler's ABI and ISA
 ifneq ($(CC_IS_CLANG),y)
@@ -186,11 +174,6 @@ else
 USE_LD_FLAG	=	-fuse-ld=bfd
 endif
 
-REPRODUCIBLE ?= n
-ifeq ($(REPRODUCIBLE),y)
-REPRODUCIBLE_FLAGS		+=	-ffile-prefix-map=$(src_dir)=
-endif
-
 # Check whether the linker supports creating PIEs
 OPENSBI_LD_PIE := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) $(USE_LD_FLAG) -fPIE -nostdlib -Wl,-pie -x c /dev/null -o /dev/null >/dev/null 2>&1 && echo y || echo n)
 
@@ -198,19 +181,16 @@ OPENSBI_LD_PIE := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) $(USE_LD_FLAG) -fP
 OPENSBI_LD_EXCLUDE_LIBS := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) $(USE_LD_FLAG) "-Wl,--exclude-libs,ALL" -x c /dev/null -o /dev/null >/dev/null 2>&1 && echo y || echo n)
 
 # Check whether the compiler supports -m(no-)save-restore
-CC_SUPPORT_SAVE_RESTORE := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -mno-save-restore -x c /dev/null -o /dev/null 2>&1 && echo y || echo n)
+CC_SUPPORT_SAVE_RESTORE := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -mno-save-restore -x c /dev/null -o /dev/null 2>&1 | grep -e "-save-restore" >/dev/null && echo n || echo y)
 
 # Check whether the compiler supports -m(no-)strict-align
-CC_SUPPORT_STRICT_ALIGN := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -mstrict-align -x c /dev/null -o /dev/null 2>&1 && echo y || echo n)
+CC_SUPPORT_STRICT_ALIGN := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -mstrict-align -x c /dev/null -o /dev/null 2>&1 | grep -e "-mstrict-align" -e "-mno-unaligned-access" >/dev/null && echo n || echo y)
 
 # Check whether the assembler and the compiler support the Zicsr and Zifencei extensions
-CC_SUPPORT_ZICSR_ZIFENCEI := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -march=rv$(OPENSBI_CC_XLEN)imafd_zicsr_zifencei -x c /dev/null -o /dev/null >/dev/null 2>&1 && echo y || echo n)
+CC_SUPPORT_ZICSR_ZIFENCEI := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -march=rv$(OPENSBI_CC_XLEN)imafd_zicsr_zifencei -x c /dev/null -o /dev/null 2>&1 | grep -e "zicsr" -e "zifencei" > /dev/null && echo n || echo y)
 
 # Check whether the assembler and the compiler support the Vector extension
 CC_SUPPORT_VECTOR := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -march=rv$(OPENSBI_CC_XLEN)gv -dM -E -x c /dev/null 2>&1 | grep -q riscv.*vector && echo y || echo n)
-
-# Check whether the compiler supports -Wthread-safety-pointer (clang >= 22)
-CC_SUPPORT_WTHREAD_SAFETY_POINTER := $(shell $(CC) $(CLANG_TARGET) $(RELAX_FLAG) -nostdlib -Wthread-safety-pointer -x c /dev/null -o /dev/null 2>&1 | grep -q "unknown warning" && echo n || echo y)
 
 ifneq ($(OPENSBI_LD_PIE),y)
 $(error Your linker does not support creating PIEs, opensbi requires this.)
@@ -222,18 +202,16 @@ endif
 BUILD_INFO ?= n
 ifeq ($(BUILD_INFO),y)
 OPENSBI_BUILD_DATE_FMT = +%Y-%m-%d %H:%M:%S %z
-ifndef OPENSBI_BUILD_TIME_STAMP
 ifdef SOURCE_DATE_EPOCH
-	OPENSBI_BUILD_TIME_STAMP := $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" \
+	OPENSBI_BUILD_TIME_STAMP ?= $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" \
 		"$(OPENSBI_BUILD_DATE_FMT)" 2>/dev/null || \
 		date -u -r "$(SOURCE_DATE_EPOCH)" \
 		"$(OPENSBI_BUILD_DATE_FMT)" 2>/dev/null || \
 		date -u "$(OPENSBI_BUILD_DATE_FMT)")
 else
-	OPENSBI_BUILD_TIME_STAMP := $(shell date "$(OPENSBI_BUILD_DATE_FMT)")
+	OPENSBI_BUILD_TIME_STAMP ?= $(shell date "$(OPENSBI_BUILD_DATE_FMT)")
 endif
-endif
-OPENSBI_BUILD_COMPILER_VERSION := $(shell $(CC) -v 2>&1 | grep ' version ' | \
+OPENSBI_BUILD_COMPILER_VERSION=$(shell $(CC) -v 2>&1 | grep ' version ' | \
 	sed 's/[[:space:]]*$$//')
 endif
 
@@ -362,10 +340,6 @@ endif
 ifeq ($(CC_IS_CLANG),y)
 GENFLAGS	+=	$(CLANG_TARGET)
 GENFLAGS	+=	-Wno-unused-command-line-argument
-GENFLAGS	+=	-Wthread-safety
-ifeq ($(CC_SUPPORT_WTHREAD_SAFETY_POINTER),y)
-GENFLAGS	+=	-Wthread-safety-pointer
-endif
 endif
 GENFLAGS	+=	-I$(platform_src_dir)/include
 GENFLAGS	+=	-I$(include_dir)
@@ -376,7 +350,6 @@ ifeq ($(BUILD_INFO),y)
 GENFLAGS	+=	-DOPENSBI_BUILD_TIME_STAMP="\"$(OPENSBI_BUILD_TIME_STAMP)\""
 GENFLAGS	+=	-DOPENSBI_BUILD_COMPILER_VERSION="\"$(OPENSBI_BUILD_COMPILER_VERSION)\""
 endif
-GENFLAGS	+=	-include $(include_dir)/sbi/sbi_visibility.h
 ifdef PLATFORM
 GENFLAGS	+=	-include $(KCONFIG_AUTOHEADER)
 endif
@@ -386,9 +359,6 @@ GENFLAGS	+=	$(firmware-genflags-y)
 
 CFLAGS		=	-g -Wall -Werror -ffreestanding -nostdlib -fno-stack-protector -fno-strict-aliasing -ffunction-sections -fdata-sections
 CFLAGS		+=	-fno-omit-frame-pointer -fno-optimize-sibling-calls
-CFLAGS		+=	-fno-asynchronous-unwind-tables -fno-unwind-tables
-CFLAGS		+=	-std=gnu11
-CFLAGS		+=	$(REPRODUCIBLE_FLAGS)
 # Optionally supported flags
 ifeq ($(CC_SUPPORT_VECTOR),y)
 CFLAGS		+=	-DOPENSBI_CC_SUPPORT_VECTOR
@@ -414,7 +384,6 @@ CPPFLAGS	+=	$(firmware-cppflags-y)
 ASFLAGS		=	-g -Wall -nostdlib
 ASFLAGS		+=	-fno-omit-frame-pointer -fno-optimize-sibling-calls
 ASFLAGS		+=	-fPIE
-ASFLAGS		+=	$(REPRODUCIBLE_FLAGS)
 # Optionally supported flags
 ifeq ($(CC_SUPPORT_SAVE_RESTORE),y)
 ASFLAGS		+=	-mno-save-restore
@@ -458,56 +427,26 @@ DTSCPPFLAGS	=	$(CPPFLAGS) -nostdinc -nostdlib -fno-builtin -D__DTS__ -x assemble
 
 ifneq ($(DEBUG),)
 CFLAGS		+=	-O0
-CPPFLAGS	+=	-DOPENSBI_DEBUG
+ELFFLAGS	+=	-Wl,--print-gc-sections
 else
 CFLAGS		+=	-O2
-endif
-
-ifeq ($(UBSAN),y)
-UBSAN_CC_FLAGS := -fsanitize=undefined
-UBSAN_CC_FLAGS += -DUBSAN_ENABLED
-UBSAN_CC_FLAGS += -fno-sanitize=vptr
-UBSAN_CC_FLAGS += -fno-sanitize=float-cast-overflow
-UBSAN_CC_FLAGS += -fno-sanitize=float-divide-by-zero
-UBSAN_CC_FLAGS += -fsanitize-recover=undefined
-UBSAN_CC_FLAGS += -fsanitize=pointer-overflow
-UBSAN_CC_FLAGS += -fsanitize=alignment
-UBSAN_CC_FLAGS += -fno-sanitize-recover=alignment
-UBSAN_CC_FLAGS += -fno-stack-protector
-ifeq ($(LLVM), y)
-UBSAN_CC_FLAGS += -fno-sanitize-link-runtime
-endif
-CFLAGS += $(UBSAN_CC_FLAGS)
-endif
-
-ifeq ($(V), 1)
-ELFFLAGS	+=	-Wl,--print-gc-sections
 endif
 
 # Setup functions for compilation
 define dynamic_flags
 -I$(shell dirname $(2)) -D__OBJNAME__=$(subst -,_,$(shell basename $(1) .o))
 endef
-
-# If the user requested silent operation (make -s), hide the
-# pretty command output by turning the echo into ":" (nop).
-ifneq ($(findstring s,$(firstword $(MAKEFLAGS))),)
-pretty_echo := :
-else
-pretty_echo := echo
-endif
-
 merge_objs = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " MERGE     $(subst $(build_dir)/,,$(1))"; \
+	     echo " MERGE     $(subst $(build_dir)/,,$(1))"; \
 	     $(LD) $(MERGEFLAGS) $(2) -o $(1)
 merge_deps = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " MERGE-DEP $(subst $(build_dir)/,,$(1))"; \
+	     echo " MERGE-DEP $(subst $(build_dir)/,,$(1))"; \
 	     cat $(2) > $(1)
 copy_file =  $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " COPY      $(subst $(build_dir)/,,$(1))"; \
+	     echo " COPY      $(subst $(build_dir)/,,$(1))"; \
 	     cp -L -f $(2) $(1)
 inst_file =  $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " INSTALL   $(subst $(install_root_dir)/,,$(1))"; \
+	     echo " INSTALL   $(subst $(install_root_dir)/,,$(1))"; \
 	     cp -L -f $(2) $(1)
 inst_file_list = $(CMD_PREFIX)if [ ! -z "$(4)" ]; then \
 	     mkdir -p $(1)/$(3); \
@@ -515,62 +454,62 @@ inst_file_list = $(CMD_PREFIX)if [ ! -z "$(4)" ]; then \
 	     rel_file=`echo $$file | sed -e 's@$(2)/$(subst $(install_firmware_path),platform,$(3))@@'`; \
 	     dest_file=$(1)"/"$(3)"/"`echo $$rel_file`; \
 	     dest_dir=`dirname $$dest_file`; \
-	     $(pretty_echo) " INSTALL   "$(3)"/"`echo $$rel_file`; \
+	     echo " INSTALL   "$(3)"/"`echo $$rel_file`; \
 	     mkdir -p $$dest_dir; \
 	     cp -L -f $$file $$dest_file; \
 	     done \
 	     fi
 inst_header_dir =  $(CMD_PREFIX)mkdir -p $(1); \
-	     $(pretty_echo) " INSTALL   $(subst $(install_root_dir)/,,$(1))"; \
+	     echo " INSTALL   $(subst $(install_root_dir)/,,$(1))"; \
 	     cp -L -rf $(2) $(1)
 compile_cpp_dep = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " CPP-DEP   $(subst $(build_dir)/,,$(1))"; \
+	     echo " CPP-DEP   $(subst $(build_dir)/,,$(1))"; \
 	     printf %s `dirname $(1)`/  > $(1) && \
 	     $(CC) $(CPPFLAGS) -x c -MM $(3) \
 	       -MT `basename $(1:.dep=$(2))` >> $(1) || rm -f $(1)
 compile_cpp = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " CPP       $(subst $(build_dir)/,,$(1))"; \
+	     echo " CPP       $(subst $(build_dir)/,,$(1))"; \
 	     $(CPP) $(CPPFLAGS) -x c $(2) | grep -v "\#" > $(1)
 compile_cc_dep = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " CC-DEP    $(subst $(build_dir)/,,$(1))"; \
+	     echo " CC-DEP    $(subst $(build_dir)/,,$(1))"; \
 	     printf %s `dirname $(1)`/  > $(1) && \
 	     $(CC) $(CFLAGS) $(call dynamic_flags,$(1),$(2))   \
 	       -MM $(2) >> $(1) || rm -f $(1)
 compile_cc = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " CC        $(subst $(build_dir)/,,$(1))"; \
+	     echo " CC        $(subst $(build_dir)/,,$(1))"; \
 	     $(CC) $(CFLAGS) $(call dynamic_flags,$(1),$(2)) -c $(2) -o $(1)
 compile_as_dep = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " AS-DEP    $(subst $(build_dir)/,,$(1))"; \
+	     echo " AS-DEP    $(subst $(build_dir)/,,$(1))"; \
 	     printf %s `dirname $(1)`/ > $(1) && \
 	     $(AS) $(ASFLAGS) $(call dynamic_flags,$(1),$(2)) \
 	       -MM $(2) >> $(1) || rm -f $(1)
 compile_as = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " AS        $(subst $(build_dir)/,,$(1))"; \
+	     echo " AS        $(subst $(build_dir)/,,$(1))"; \
 	     $(AS) $(ASFLAGS) $(call dynamic_flags,$(1),$(2)) -c $(2) -o $(1)
 compile_elf = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " ELF       $(subst $(build_dir)/,,$(1))"; \
+	     echo " ELF       $(subst $(build_dir)/,,$(1))"; \
 	     $(CC) $(CFLAGS) $(3) $(ELFFLAGS) -Wl,-T$(2) -o $(1)
 compile_ar = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " AR        $(subst $(build_dir)/,,$(1))"; \
+	     echo " AR        $(subst $(build_dir)/,,$(1))"; \
 	     $(AR) $(ARFLAGS) $(1) $(2)
 compile_objcopy = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " OBJCOPY   $(subst $(build_dir)/,,$(1))"; \
+	     echo " OBJCOPY   $(subst $(build_dir)/,,$(1))"; \
 	     $(OBJCOPY) -S -O binary $(2) $(1)
 compile_dts = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " DTC       $(subst $(build_dir)/,,$(1))"; \
+	     echo " DTC       $(subst $(build_dir)/,,$(1))"; \
 	     $(CPP) $(DTSCPPFLAGS) $(2) | $(DTC) -O dtb -i `dirname $(2)` -o $(1)
 compile_d2c = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " D2C       $(subst $(build_dir)/,,$(1))"; \
+	     echo " D2C       $(subst $(build_dir)/,,$(1))"; \
 	     $(if $($(2)-varalign-$(3)),$(eval D2C_ALIGN_BYTES := $($(2)-varalign-$(3))),$(eval D2C_ALIGN_BYTES := $(4))) \
 	     $(if $($(2)-varprefix-$(3)),$(eval D2C_NAME_PREFIX := $($(2)-varprefix-$(3))),$(eval D2C_NAME_PREFIX := $(5))) \
 	     $(if $($(2)-padding-$(3)),$(eval D2C_PADDING_BYTES := $($(2)-padding-$(3))),$(eval D2C_PADDING_BYTES := 0)) \
 	     $(src_dir)/scripts/d2c.sh -i $(6) -a $(D2C_ALIGN_BYTES) -p $(D2C_NAME_PREFIX) -t $(D2C_PADDING_BYTES) > $(1)
 compile_carray = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " CARRAY    $(subst $(build_dir)/,,$(1))"; \
+	     echo " CARRAY    $(subst $(build_dir)/,,$(1))"; \
 	     $(eval CARRAY_VAR_LIST := $(carray-$(subst .carray.c,,$(shell basename $(1)))-y)) \
 	     $(src_dir)/scripts/carray.sh -i $(2) -l "$(CARRAY_VAR_LIST)" > $(1) || rm $(1)
 compile_gen_dep = $(CMD_PREFIX)mkdir -p `dirname $(1)`; \
-	     $(pretty_echo) " GEN-DEP   $(subst $(build_dir)/,,$(1))"; \
+	     echo " GEN-DEP   $(subst $(build_dir)/,,$(1))"; \
 	     echo "$(1:.dep=$(2)): $(3)" >> $(1)
 
 targets-y  = $(build_dir)/lib/libsbi.a

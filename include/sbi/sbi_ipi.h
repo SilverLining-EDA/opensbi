@@ -23,9 +23,6 @@ struct sbi_ipi_device {
 	/** Name of the IPI device */
 	char name[32];
 
-	/** Ratings of the IPI device (higher is better) */
-	unsigned long rating;
-
 	/** Send IPI to a target HART index */
 	void (*ipi_send)(u32 hart_index);
 
@@ -88,13 +85,13 @@ int sbi_ipi_send_halt(ulong hmask, ulong hbase);
 
 void sbi_ipi_process(void);
 
-int sbi_ipi_raw_send(u32 hartindex, bool all_devices);
+int sbi_ipi_raw_send(u32 hartindex);
 
-void sbi_ipi_raw_clear(bool all_devices);
+void sbi_ipi_raw_clear(void);
 
 const struct sbi_ipi_device *sbi_ipi_get_device(void);
 
-void sbi_ipi_add_device(const struct sbi_ipi_device *dev);
+void sbi_ipi_set_device(const struct sbi_ipi_device *dev);
 
 int sbi_ipi_init(struct sbi_scratch *scratch, bool cold_boot);
 

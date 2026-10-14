@@ -13,13 +13,10 @@
 #include <sbi/sbi_console.h>
 #include <sbi/sbi_cppc.h>
 #include <sbi/sbi_domain.h>
-#include <sbi/sbi_double_trap.h>
 #include <sbi/sbi_ecall.h>
 #include <sbi/sbi_fwft.h>
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_hartmask.h>
-#include <sbi/sbi_hart_pmp.h>
-#include <sbi/sbi_hart_protection.h>
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_hsm.h>
 #include <sbi/sbi_ipi.h>
@@ -92,8 +89,6 @@ static void sbi_boot_print_general(struct sbi_scratch *scratch)
 	sbi_printf("Platform Features           : %s\n", str);
 	sbi_printf("Platform HART Count         : %u\n",
 		   sbi_platform_hart_count(plat));
-	sbi_hart_protection_get_str(str, sizeof(str));
-	sbi_printf("Platform HART Protection    : %s\n", str);
 	idev = sbi_ipi_get_device();
 	sbi_printf("Platform IPI Device         : %s\n",
 		   (idev) ? idev->name : "---");
@@ -165,7 +160,7 @@ static void sbi_boot_print_domains(struct sbi_scratch *scratch)
 static void sbi_boot_print_hart(struct sbi_scratch *scratch, u32 hartid)
 {
 	int xlen;
-	char str[256];
+	char str[128];
 	const struct sbi_domain *dom = sbi_domain_thishart_ptr();
 
 	if (scratch->options & SBI_SCRATCH_NO_BOOT_PRINTS)
@@ -216,10 +211,18 @@ static void wake_coldboot_harts(struct sbi_scratch *scratch)
 	__smp_store_release(&coldboot_done, 1);
 }
 
-unsigned long __attribute__((weak)) __stack_chk_guard = 0x95B5FF5A;
-
 static unsigned long entry_count_offset;
 static unsigned long init_count_offset;
+
+static void cva6_host_uart_putc(char ch)
+{
+	*(volatile unsigned char *)0x10000000 = (unsigned char)ch;
+}
+
+static struct sbi_console_device cva6_host_uart_console = {
+	.name = "cva6-host-uart",
+	.console_putc = cva6_host_uart_putc,
+};
 
 static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 {
@@ -227,17 +230,18 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 	unsigned long *count;
 	const struct sbi_platform *plat = sbi_platform_ptr(scratch);
 
+	sbi_console_set_device(&cva6_host_uart_console);
+	sbi_printf("\nCVA6: OpenSBI coldboot hart %u\n", hartid);
+
 	/* Note: This has to be first thing in coldboot init sequence */
 	rc = sbi_scratch_init(scratch);
 	if (rc)
 		sbi_hart_hang();
 
-	/* Note: This has to be second thing in coldboot init sequence */
 	rc = sbi_heap_init(scratch);
 	if (rc)
 		sbi_hart_hang();
 
-	/* Note: This has to be the third thing in coldboot init sequence */
 	rc = sbi_domain_init(scratch, hartid);
 	if (rc)
 		sbi_hart_hang();
@@ -257,67 +261,21 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 	if (rc)
 		sbi_hart_hang();
 
-	/*
-	 * All non-coldboot HARTs do HSM initialization (i.e. enter HSM state
-	 * machine) at the start of the warmboot path so it is wasteful to
-	 * have these HARTs busy spin in wait_for_coldboot() until coldboot
-	 * path is completed.
-	 */
 	wake_coldboot_harts(scratch);
+
+	rc = sbi_platform_early_init(plat, true);
+	if (rc)
+		sbi_hart_hang();
 
 	rc = sbi_hart_init(scratch, true);
 	if (rc)
 		sbi_hart_hang();
 
-	/*
-	 * Initialize stack guard via Zkr entropy source if Zkr is
-	 * implemented according to device tree. Writing new seed value
-	 * to __stack_chk_guard is safe here because function doesn't
-	 * return and no check against value on entry will be done.
-	 */
-	if (sbi_hart_has_extension(scratch, SBI_HART_EXT_ZKR)) {
-		unsigned long guard_val = 0;
-		int chunks = sizeof(unsigned long) / sizeof(uint16_t);
-#ifndef CONFIG_ZKR_POLL_BUDGET
-#define CONFIG_ZKR_POLL_BUDGET		1000
-#endif
-		unsigned int tries = CONFIG_ZKR_POLL_BUDGET;
-		bool res = false;
-
-		while (chunks && tries) {
-			unsigned long seed = csr_swap(CSR_SEED, 0);
-			unsigned long opst = seed & SEED_OPTS_MASK;
-			res = false;
-
-			if (opst == SEED_OPTS_DEAD) {
-				break;
-			}
-			if (opst == SEED_OPTS_ES16) {
-				guard_val = (guard_val << 16) | (seed & SEED_ENTROPY_MASK);
-				chunks--;
-				res = true;
-				/* Successful read doesn't consume a try */
-				tries++;
-			}
-
-			tries--;
-			continue;
-		}
-		if (res)
-			__stack_chk_guard = guard_val;
+	rc = sbi_sse_init(scratch, true);
+	if (rc) {
+		sbi_printf("%s: sse init failed (error %d)\n", __func__, rc);
+		sbi_hart_hang();
 	}
-
-	rc = sbi_trap_init(scratch, true);
-	if (rc)
-		sbi_hart_hang();
-
-	rc = sbi_timer_init(scratch, true);
-	if (rc)
-		sbi_hart_hang();
-
-	rc = sbi_platform_early_init(plat, true);
-	if (rc)
-		sbi_hart_hang();
 
 	rc = sbi_pmu_init(scratch, true);
 	if (rc) {
@@ -331,8 +289,6 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 		sbi_hart_hang();
 
 	sbi_boot_print_banner(scratch);
-
-	sbi_double_trap_init(scratch);
 
 	rc = sbi_irqchip_init(scratch, true);
 	if (rc) {
@@ -353,6 +309,12 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 		sbi_hart_hang();
 	}
 
+	rc = sbi_timer_init(scratch, true);
+	if (rc) {
+		sbi_printf("%s: timer init failed (error %d)\n", __func__, rc);
+		sbi_hart_hang();
+	}
+
 	rc = sbi_fwft_init(scratch, true);
 	if (rc) {
 		sbi_printf("%s: fwft init failed (error %d)\n", __func__, rc);
@@ -364,13 +326,13 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 		sbi_printf("%s: mpxy init failed (error %d)\n", __func__, rc);
 		sbi_hart_hang();
 	}
-
 	/*
-	 * Note: Finalize domains after HSM initialization
+	 * Note: Finalize domains after HSM initialization so that we
+	 * can startup non-root domains.
 	 * Note: Finalize domains before HART PMP configuration so
 	 * that we use correct domain for configuring PMP.
 	 */
-	rc = sbi_domain_finalize(scratch);
+	rc = sbi_domain_finalize(scratch, hartid);
 	if (rc) {
 		sbi_printf("%s: domain finalize failed (error %d)\n",
 			   __func__, rc);
@@ -386,16 +348,6 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 	if (rc) {
 		sbi_printf("%s: platform final init failed (error %d)\n",
 			   __func__, rc);
-		sbi_hart_hang();
-	}
-
-	/*
-	 * Note: SSE events callbacks can be registered by other drivers so
-	 * sbi_sse_init() needs to be called after all drivers have been probed.
-	 */
-	rc = sbi_sse_init(scratch, true);
-	if (rc) {
-		sbi_printf("%s: sse init failed (error %d)\n", __func__, rc);
 		sbi_hart_hang();
 	}
 
@@ -419,23 +371,12 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 	run_all_tests();
 
 	/*
-	 * Note: Startup domains after all initialization are done
-	 * otherwise boot HART of non-root domain can crash.
+	 * Configure PMP at last because if SMEPMP is detected,
+	 * M-mode access to the S/U space will be rescinded.
 	 */
-	rc = sbi_domain_startup(scratch, hartid);
+	rc = sbi_hart_pmp_configure(scratch);
 	if (rc) {
-		sbi_printf("%s: domain startup failed (error %d)\n",
-			   __func__, rc);
-		sbi_hart_hang();
-	}
-
-	/*
-	 * Configure hart protection at last because if SMEPMP is
-	 * detected, M-mode access to the S/U space will be rescinded.
-	 */
-	rc = sbi_hart_protection_configure(scratch, sbi_domain_thishart_ptr());
-	if (rc) {
-		sbi_printf("%s: hart protection configure failed (error %d)\n",
+		sbi_printf("%s: PMP configure failed (error %d)\n",
 			   __func__, rc);
 		sbi_hart_hang();
 	}
@@ -464,19 +405,15 @@ static void __noreturn init_warm_startup(struct sbi_scratch *scratch,
 	if (rc)
 		sbi_hart_hang();
 
+	rc = sbi_platform_early_init(plat, false);
+	if (rc)
+		sbi_hart_hang();
+
 	rc = sbi_hart_init(scratch, false);
 	if (rc)
 		sbi_hart_hang();
 
-	rc = sbi_trap_init(scratch, false);
-	if (rc)
-		sbi_hart_hang();
-
-	rc = sbi_timer_init(scratch, false);
-	if (rc)
-		sbi_hart_hang();
-
-	rc = sbi_platform_early_init(plat, false);
+	rc = sbi_sse_init(scratch, false);
 	if (rc)
 		sbi_hart_hang();
 
@@ -500,6 +437,10 @@ static void __noreturn init_warm_startup(struct sbi_scratch *scratch,
 	if (rc)
 		sbi_hart_hang();
 
+	rc = sbi_timer_init(scratch, false);
+	if (rc)
+		sbi_hart_hang();
+
 	rc = sbi_fwft_init(scratch, false);
 	if (rc)
 		sbi_hart_hang();
@@ -508,15 +449,11 @@ static void __noreturn init_warm_startup(struct sbi_scratch *scratch,
 	if (rc)
 		sbi_hart_hang();
 
-	rc = sbi_sse_init(scratch, false);
-	if (rc)
-		sbi_hart_hang();
-
 	/*
-	 * Configure hart protection at last because if SMEPMP is
-	 * detected, M-mode access to the S/U space will be rescinded.
+	 * Configure PMP at last because if SMEPMP is detected,
+	 * M-mode access to the S/U space will be rescinded.
 	 */
-	rc = sbi_hart_protection_configure(scratch, sbi_domain_thishart_ptr());
+	rc = sbi_hart_pmp_configure(scratch);
 	if (rc)
 		sbi_hart_hang();
 
@@ -537,7 +474,7 @@ static void __noreturn init_warm_resume(struct sbi_scratch *scratch,
 	if (rc)
 		sbi_hart_hang();
 
-	rc = sbi_hart_protection_configure(scratch, sbi_domain_thishart_ptr());
+	rc = sbi_hart_pmp_configure(scratch);
 	if (rc)
 		sbi_hart_hang();
 
@@ -557,12 +494,10 @@ static void __noreturn init_warmboot(struct sbi_scratch *scratch, u32 hartid)
 	if (hstate == SBI_HSM_STATE_SUSPENDED) {
 		init_warm_resume(scratch, hartid);
 	} else {
-		sbi_ipi_raw_clear(true);
+		sbi_ipi_raw_clear();
 		init_warm_startup(scratch, hartid);
 	}
 }
-
-static atomic_t coldboot_lottery = ATOMIC_INITIALIZER(0);
 
 /**
  * Initialize OpenSBI library for current HART and jump to next
@@ -610,8 +545,8 @@ void __noreturn sbi_init(struct sbi_scratch *scratch)
 	 */
 
 	if (sbi_platform_cold_boot_allowed(plat, hartid)) {
-		if (next_mode_supported &&
-		    atomic_xchg(&coldboot_lottery, 1) == 0)
+		if (next_mode_supported)
+			/* Single-hart CVA6: amoswap.w.aqrl to HBM never completes. */
 			coldboot = true;
 	}
 
@@ -627,19 +562,6 @@ void __noreturn sbi_init(struct sbi_scratch *scratch)
 		init_coldboot(scratch, hartid);
 	else
 		init_warmboot(scratch, hartid);
-}
-
-void sbi_revert_entry_count(struct sbi_scratch *scratch)
-{
-	unsigned long *entry_count, *init_count;
-
-	if (!entry_count_offset || !init_count_offset)
-		sbi_hart_hang();
-
-	entry_count = sbi_scratch_offset_ptr(scratch, entry_count_offset);
-	init_count = sbi_scratch_offset_ptr(scratch, init_count_offset);
-
-	*entry_count = *init_count;
 }
 
 unsigned long sbi_entry_count(u32 hartindex)

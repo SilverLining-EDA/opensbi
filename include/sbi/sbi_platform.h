@@ -39,8 +39,6 @@
 #define SBI_PLATFORM_FIRMWARE_CONTEXT_OFFSET (0x60 + __SIZEOF_POINTER__)
 /** Offset of hart_index2id in struct sbi_platform */
 #define SBI_PLATFORM_HART_INDEX2ID_OFFSET (0x60 + (__SIZEOF_POINTER__ * 2))
-/** Offset of cbom_block_size in struct sbi_platform */
-#define SBI_PLATFORM_CBOM_BLOCK_SIZE_OFFSET (0x60 + (__SIZEOF_POINTER__ * 3))
 
 #define SBI_PLATFORM_TLB_RANGE_FLUSH_LIMIT_DEFAULT		(1UL << 12)
 
@@ -55,6 +53,7 @@
 struct sbi_domain_memregion;
 struct sbi_ecall_return;
 struct sbi_trap_regs;
+struct sbi_hart_features;
 union sbi_ldst_data;
 
 /** Possible feature flags of a platform */
@@ -74,9 +73,6 @@ enum sbi_platform_features {
 struct sbi_platform_operations {
 	/* Check if specified HART is allowed to do cold boot */
 	bool (*cold_boot_allowed)(u32 hartid);
-
-	/* Check if platform requires single firmware region */
-	bool (*single_fw_region)(void);
 
 	/* Platform nascent initialization */
 	int (*nascent_init)(void);
@@ -104,7 +100,7 @@ struct sbi_platform_operations {
 	int (*misa_get_xlen)(void);
 
 	/** Initialize (or populate) HART extensions for the platform */
-	int (*extensions_init)(bool cold_boot);
+	int (*extensions_init)(struct sbi_hart_features *hfeatures);
 
 	/** Initialize (or populate) domains for the platform */
 	int (*domains_init)(void);
@@ -118,6 +114,9 @@ struct sbi_platform_operations {
 	/** Initialize the platform interrupt controller during cold boot */
 	int (*irqchip_init)(void);
 
+	/** Initialize IPI during cold boot */
+	int (*ipi_init)(void);
+
 	/** Get tlb flush limit value **/
 	u64 (*get_tlbr_flush_limit)(void);
 
@@ -130,41 +129,23 @@ struct sbi_platform_operations {
 	/** Initialize the platform Message Proxy(MPXY) driver */
 	int (*mpxy_init)(void);
 
+	/** Check if SBI vendor extension is implemented or not */
+	bool (*vendor_ext_check)(void);
 	/** platform specific SBI extension implementation provider */
 	int (*vendor_ext_provider)(long funcid,
 				   struct sbi_trap_regs *regs,
 				   struct sbi_ecall_return *out);
 
-	/** platform specific handler to fixup load fault
-	 *  Refer to comments below at sbi_platform_emulate_load */
-	int (*emulate_load)(ulong insn, int rlen, ulong addr,
-			    union sbi_ldst_data *out_val,
-			    struct sbi_trap_context *tcntx);
-
-	/** platform specific handler to fixup store fault
-	 *  Refer to comments below at sbi_platform_emulate_store */
-	int (*emulate_store)(ulong insn, int wlen, ulong addr,
-			     union sbi_ldst_data in_val,
-			     struct sbi_trap_context *tcntx);
-
-	/** platform specific pmp setup on current HART */
-	void (*pmp_set)(unsigned int n, unsigned long flags,
-			unsigned long prot, unsigned long addr,
-			unsigned long log2len);
-	/** platform specific pmp disable on current HART */
-	void (*pmp_disable)(unsigned int n);
-
-	/** platform specific Smrnmi handlers init on current HART */
-	void (*smrnmi_handlers_init)(void (*rnmi_handler)(void),
-			void (*rnme_handler)(void));
-
-	/** platform specific Smrnmi NMI handler.
-	 *  Returns SBI_SUCCESS on success, error code if NMI cannot be handled. */
-	int (*rnmi_handler)(struct sbi_trap_context *tcntx);
+	/** platform specific handler to fixup load fault */
+	int (*emulate_load)(int rlen, unsigned long addr,
+			    union sbi_ldst_data *out_val);
+	/** platform specific handler to fixup store fault */
+	int (*emulate_store)(int wlen, unsigned long addr,
+			     union sbi_ldst_data in_val);
 };
 
 /** Platform default per-HART stack size for exception/interrupt handling */
-#define SBI_PLATFORM_DEFAULT_HART_STACK_SIZE	CONFIG_DEFAULT_HART_STACK_SIZE
+#define SBI_PLATFORM_DEFAULT_HART_STACK_SIZE	8192
 
 /** Platform default heap size */
 #define SBI_PLATFORM_DEFAULT_HEAP_SIZE(__num_hart)	\
@@ -188,7 +169,7 @@ struct sbi_platform {
 	char name[64];
 	/** Supported features */
 	u64 features;
-	/** Total number of HARTs (at most SBI_HARTMASK_MAX_BITS) */
+	/** Total number of HARTs */
 	u32 hart_count;
 	/** Per-HART stack size for exception/interrupt handling */
 	u32 hart_stack_size;
@@ -203,34 +184,70 @@ struct sbi_platform {
 	/**
 	 * HART index to HART id table
 	 *
-	 * If hart_index2id != NULL then the table must contain a mapping
-	 * for each HART index 0 <= <abc> < hart_count:
+	 * For used HART index <abc>:
 	 *     hart_index2id[<abc>] = some HART id
+	 * For unused HART index <abc>:
+	 *     hart_index2id[<abc>] = -1U
 	 *
 	 * If hart_index2id == NULL then we assume identity mapping
 	 *     hart_index2id[<abc>] = <abc>
+	 *
+	 * We have only two restrictions:
+	 * 1. HART index < sbi_platform hart_count
+	 * 2. HART id < SBI_HARTMASK_MAX_BITS
 	 */
 	const u32 *hart_index2id;
-	/** Allocation alignment for Scratch */
-	unsigned long cbom_block_size;
 };
 
 /**
  * Prevent modification of struct sbi_platform from affecting
  * SBI_PLATFORM_xxx_OFFSET
  */
-assert_member_offset(struct sbi_platform, opensbi_version, SBI_PLATFORM_OPENSBI_VERSION_OFFSET);
-assert_member_offset(struct sbi_platform, platform_version, SBI_PLATFORM_VERSION_OFFSET);
-assert_member_offset(struct sbi_platform, name, SBI_PLATFORM_NAME_OFFSET);
-assert_member_offset(struct sbi_platform, features, SBI_PLATFORM_FEATURES_OFFSET);
-assert_member_offset(struct sbi_platform, hart_count, SBI_PLATFORM_HART_COUNT_OFFSET);
-assert_member_offset(struct sbi_platform, hart_stack_size, SBI_PLATFORM_HART_STACK_SIZE_OFFSET);
-assert_member_offset(struct sbi_platform, heap_size, SBI_PLATFORM_HEAP_SIZE_OFFSET);
-assert_member_offset(struct sbi_platform, reserved, SBI_PLATFORM_RESERVED_OFFSET);
-assert_member_offset(struct sbi_platform, platform_ops_addr, SBI_PLATFORM_OPS_OFFSET);
-assert_member_offset(struct sbi_platform, firmware_context, SBI_PLATFORM_FIRMWARE_CONTEXT_OFFSET);
-assert_member_offset(struct sbi_platform, hart_index2id, SBI_PLATFORM_HART_INDEX2ID_OFFSET);
-assert_member_offset(struct sbi_platform, cbom_block_size, SBI_PLATFORM_CBOM_BLOCK_SIZE_OFFSET);
+_Static_assert(
+	offsetof(struct sbi_platform, opensbi_version)
+		== SBI_PLATFORM_OPENSBI_VERSION_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_OPENSBI_VERSION_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, platform_version)
+		== SBI_PLATFORM_VERSION_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_VERSION_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, name)
+		== SBI_PLATFORM_NAME_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_NAME_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, features)
+		== SBI_PLATFORM_FEATURES_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_FEATURES_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, hart_count)
+		== SBI_PLATFORM_HART_COUNT_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_HART_COUNT_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, hart_stack_size)
+		== SBI_PLATFORM_HART_STACK_SIZE_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_HART_STACK_SIZE_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, platform_ops_addr)
+		== SBI_PLATFORM_OPS_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_OPS_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, firmware_context)
+		== SBI_PLATFORM_FIRMWARE_CONTEXT_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_FIRMWARE_CONTEXT_OFFSET");
+_Static_assert(
+	offsetof(struct sbi_platform, hart_index2id)
+		== SBI_PLATFORM_HART_INDEX2ID_OFFSET,
+	"struct sbi_platform definition has changed, please redefine "
+	"SBI_PLATFORM_HART_INDEX2ID_OFFSET");
 
 /** Get pointer to sbi_platform for sbi_scratch pointer */
 #define sbi_platform_ptr(__s) \
@@ -314,7 +331,7 @@ static inline u32 sbi_platform_tlb_fifo_num_entries(const struct sbi_platform *p
 {
 	if (plat && sbi_platform_ops(plat)->get_tlb_num_entries)
 		return sbi_platform_ops(plat)->get_tlb_num_entries();
-	return sbi_hart_count();
+	return sbi_scratch_last_hartindex() + 1;
 }
 
 /**
@@ -360,24 +377,6 @@ static inline bool sbi_platform_cold_boot_allowed(
 	if (plat && sbi_platform_ops(plat)->cold_boot_allowed)
 		return sbi_platform_ops(plat)->cold_boot_allowed(hartid);
 	return true;
-}
-
-/**
- * Check whether platform requires single firmware region
- *
- * Note: Single firmware region only works with legacy PMP because with
- * Smepmp M-mode only regions can't have RWX permissions.
- *
- * @param plat pointer to struct sbi_platform
- *
- * @return true if single firmware region required and false otherwise
- */
-static inline bool sbi_platform_single_fw_region(
-					const struct sbi_platform *plat)
-{
-	if (plat && sbi_platform_ops(plat)->single_fw_region)
-		return sbi_platform_ops(plat)->single_fw_region();
-	return false;
 }
 
 /**
@@ -490,10 +489,10 @@ static inline int sbi_platform_misa_xlen(const struct sbi_platform *plat)
  */
 static inline int sbi_platform_extensions_init(
 					const struct sbi_platform *plat,
-					bool cold_boot)
+					struct sbi_hart_features *hfeatures)
 {
 	if (plat && sbi_platform_ops(plat)->extensions_init)
-		return sbi_platform_ops(plat)->extensions_init(cold_boot);
+		return sbi_platform_ops(plat)->extensions_init(hfeatures);
 	return 0;
 }
 
@@ -559,6 +558,20 @@ static inline int sbi_platform_irqchip_init(const struct sbi_platform *plat)
 }
 
 /**
+ * Initialize the platform IPI support during cold boot
+ *
+ * @param plat pointer to struct sbi_platform
+ *
+ * @return 0 on success and negative error code on failure
+ */
+static inline int sbi_platform_ipi_init(const struct sbi_platform *plat)
+{
+	if (plat && sbi_platform_ops(plat)->ipi_init)
+		return sbi_platform_ops(plat)->ipi_init();
+	return 0;
+}
+
+/**
  * Initialize the platform timer during cold boot
  *
  * @param plat pointer to struct sbi_platform
@@ -596,7 +609,10 @@ static inline int sbi_platform_mpxy_init(const struct sbi_platform *plat)
 static inline bool sbi_platform_vendor_ext_check(
 					const struct sbi_platform *plat)
 {
-	return plat && sbi_platform_ops(plat)->vendor_ext_provider;
+	if (plat && sbi_platform_ops(plat)->vendor_ext_check)
+		return sbi_platform_ops(plat)->vendor_ext_check();
+
+	return false;
 }
 
 /**
@@ -624,110 +640,47 @@ static inline int sbi_platform_vendor_ext_provider(
 }
 
 /**
- * Ask platform to emulate the trapped load:
+ * Ask platform to emulate the trapped load
  *
- * @param insn the instruction that caused the load fault.
- *             It could be a transformed instruction from tinst, thus do
- *             not rely on the length of insn, and use appropriate return
- *             code, so the caller can advance mepc properly.
- * @param rlen read length in [0, 1, 2, 4, 8]. If 0, it's a special load.
- *             In that case, it could be a vector load or customized insn,
- *             which may read/gather a block of memory. The emulator should
- *             further parse the @insn (fetch if 0), and act accordingly.
- * @param raddr read address. If @rlen is not 0, it's the base address of
- *              the load. It doesn't necessarily match tcntx->trap->tval,
- *              in case of unaligned load triggering access fault.
- *              If @rlen is 0, @raddr should be ignored.
- * @param out_val the buffer to hold data loaded by the emulator.
- *                If @rlen == 0, @out_val is ignored by caller.
- * @param tcntx trap context saved on load fault entry.
+ * @param plat pointer to struct sbi_platform
+ * @param rlen length of the load: 1/2/4/8...
+ * @param addr virtual address of the load. Platform needs to page-walk and
+ *        find the physical address if necessary
+ * @param out_val value loaded
  *
- * @return >0 success: register will be updated by caller if @rlen != 0,
- *            and mepc will be advanced by caller.
- *         0  success: no register modification; no mepc advancement.
- *         <0 failure
- *
- * It's expected that if @rlen != 0, and the emulator returns >0, the
- * caller will set the corresponding registers with @out_val to simplify
- * things. Otherwise, no register manipulation is done by the caller.
+ * @return 0 on success and negative error code on failure
  */
 static inline int sbi_platform_emulate_load(const struct sbi_platform *plat,
-					    ulong insn, int rlen, ulong raddr,
-					    union sbi_ldst_data *out_val,
-					    struct sbi_trap_context *tcntx)
+					    int rlen, unsigned long addr,
+					    union sbi_ldst_data *out_val)
 {
 	if (plat && sbi_platform_ops(plat)->emulate_load) {
-		return sbi_platform_ops(plat)->emulate_load(insn, rlen, raddr,
-							    out_val, tcntx);
+		return sbi_platform_ops(plat)->emulate_load(rlen, addr,
+							    out_val);
 	}
 	return SBI_ENOTSUPP;
 }
 
 /**
- * Ask platform to emulate the trapped store:
+ * Ask platform to emulate the trapped store
  *
- * @param insn the instruction that caused the store fault.
- *             It could be a transformed instruction from tinst, thus do
- *             not rely on the length of insn, and use appropriate return
- *             code, so the caller can advance mepc properly.
- * @param wlen write length in [0, 1, 2, 4, 8]. If 0, it's a special store.
- *             In that case, it could be a vector store or customized insn,
- *             which may write/scatter a block of memory. The emulator should
- *             further parse the @insn (fetch if 0), and act accordingly.
- * @param waddr write address. If @wlen is not 0, it's the base address of
- *              the store. It doesn't necessarily match tcntx->trap->tval,
- *              in case of unaligned store triggering access fault.
- *              If @wlen is 0, @waddr should be ignored.
- * @param in_val the buffer to hold data about to be stored by the emulator.
- *               If @wlen == 0, @in_val should be ignored.
- * @param tcntx trap context saved on store fault entry.
+ * @param plat pointer to struct sbi_platform
+ * @param wlen length of the store: 1/2/4/8...
+ * @param addr virtual address of the store. Platform needs to page-walk and
+ *        find the physical address if necessary
+ * @param in_val value to store
  *
- * @return >0 success: mepc will be advanced by caller.
- *         0  success: no mepc advancement.
- *         <0 failure
+ * @return 0 on success and negative error code on failure
  */
 static inline int sbi_platform_emulate_store(const struct sbi_platform *plat,
-					     ulong insn, int wlen, ulong waddr,
-					     union sbi_ldst_data in_val,
-					     struct sbi_trap_context *tcntx)
+					     int wlen, unsigned long addr,
+					     union sbi_ldst_data in_val)
 {
 	if (plat && sbi_platform_ops(plat)->emulate_store) {
-		return sbi_platform_ops(plat)->emulate_store(insn, wlen, waddr,
-							     in_val, tcntx);
+		return sbi_platform_ops(plat)->emulate_store(wlen, addr,
+							     in_val);
 	}
 	return SBI_ENOTSUPP;
-}
-
-/**
- * Platform specific PMP setup on current HART
- *
- * @param plat pointer to struct sbi_platform
- * @param n index of the pmp entry
- * @param flags domain memregion flags
- * @param prot attribute of the pmp entry
- * @param addr address of the pmp entry
- * @param log2len size of the pmp entry as power-of-2
- */
-static inline void sbi_platform_pmp_set(const struct sbi_platform *plat,
-					unsigned int n, unsigned long flags,
-					unsigned long prot, unsigned long addr,
-					unsigned long log2len)
-{
-	if (plat && sbi_platform_ops(plat)->pmp_set)
-		sbi_platform_ops(plat)->pmp_set(n, flags, prot, addr, log2len);
-}
-
-/**
- * Platform specific PMP disable on current HART
- *
- * @param plat pointer to struct sbi_platform
- * @param n index of the pmp entry
- */
-static inline void sbi_platform_pmp_disable(const struct sbi_platform *plat,
-					    unsigned int n)
-{
-	if (plat && sbi_platform_ops(plat)->pmp_disable)
-		sbi_platform_ops(plat)->pmp_disable(n);
 }
 
 #endif

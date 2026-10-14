@@ -13,7 +13,6 @@
 #include <sbi/sbi_list.h>
 
 struct sbi_scratch;
-struct sbi_domain;
 
 #define SBI_MPXY_MSGPROTO_VERSION(Major, Minor) ((Major << 16) | Minor)
 
@@ -98,8 +97,6 @@ struct sbi_mpxy_channel {
 	/** List head to a set of channels */
 	struct sbi_dlist head;
 	u32 channel_id;
-
-	struct sbi_domain *owner_domain;
 	struct sbi_mpxy_channel_attrs attrs;
 
 	/**
@@ -156,13 +153,11 @@ int sbi_mpxy_init(struct sbi_scratch *scratch);
 /** Check if some Message proxy channel is available */
 bool sbi_mpxy_channel_available(void);
 
-/** Get message proxy shared memory size */
-unsigned long sbi_mpxy_get_shmem_size(void);
-
-/** Set message proxy shared memory on the calling HART */
-int sbi_mpxy_set_shmem(unsigned long shmem_phys_lo,
-		       unsigned long shmem_phys_hi,
-		       unsigned long flags);
+/** Set Message proxy shared memory on the calling HART */
+int sbi_mpxy_set_shmem(unsigned long shmem_size,
+			unsigned long shmem_phys_lo,
+			unsigned long shmem_phys_hi,
+			unsigned long flags);
 
 /** Get channel IDs list */
 int sbi_mpxy_get_channel_ids(u32 start_index);
@@ -184,4 +179,5 @@ int sbi_mpxy_send_message(u32 channel_id, u8 msg_id,
 /** Get Message proxy notification events */
 int sbi_mpxy_get_notification_events(u32 channel_id,
 					unsigned long *events_len);
+
 #endif

@@ -7,14 +7,8 @@
 #   Anup Patel <apatel@ventanamicro.com>
 #
 
-carray-fdt_early_drivers-$(CONFIG_FDT_HSM_ANDES_ATCSMU) += fdt_hsm_andes_atcsmu
-libsbiutils-objs-$(CONFIG_FDT_HSM_ANDES_ATCSMU) += hsm/fdt_hsm_andes_atcsmu.o
+libsbiutils-objs-$(CONFIG_FDT_HSM) += hsm/fdt_hsm.o
+libsbiutils-objs-$(CONFIG_FDT_HSM) += hsm/fdt_hsm_drivers.carray.o
 
-carray-fdt_early_drivers-$(CONFIG_FDT_HSM_RPMI) += fdt_hsm_rpmi
+carray-fdt_hsm_drivers-$(CONFIG_FDT_HSM_RPMI) += fdt_hsm_rpmi
 libsbiutils-objs-$(CONFIG_FDT_HSM_RPMI) += hsm/fdt_hsm_rpmi.o
-
-carray-fdt_early_drivers-$(CONFIG_FDT_HSM_SPACEMIT) += fdt_hsm_spacemit
-libsbiutils-objs-$(CONFIG_FDT_HSM_SPACEMIT) += hsm/fdt_hsm_spacemit.o
-
-carray-fdt_early_drivers-$(CONFIG_FDT_HSM_SIFIVE_TMC0) += fdt_hsm_sifive_tmc0
-libsbiutils-objs-$(CONFIG_FDT_HSM_SIFIVE_TMC0) += hsm/fdt_hsm_sifive_tmc0.o

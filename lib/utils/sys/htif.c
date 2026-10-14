@@ -46,25 +46,22 @@
 
 #define PK_SYS_write 64
 
-static spinlock_t htif_lock = SPIN_LOCK_INITIALIZER;
+volatile uint64_t tohost __attribute__((section(".htif")));
+volatile uint64_t fromhost __attribute__((section(".htif")));
 
-volatile uint64_t tohost
-	__attribute__((section(".htif"))) GUARDED_BY(&htif_lock);
-volatile uint64_t fromhost
-	__attribute__((section(".htif"))) GUARDED_BY(&htif_lock);
-
-static uint64_t *htif_fromhost PT_GUARDED_BY(&htif_lock) = NULL;
-static uint64_t *htif_tohost PT_GUARDED_BY(&htif_lock)	 = NULL;
+static uint64_t *htif_fromhost = NULL;
+static uint64_t *htif_tohost = NULL;
 static bool htif_custom = false;
 
-static int htif_console_buf GUARDED_BY(&htif_lock);
+static int htif_console_buf;
+static spinlock_t htif_lock = SPIN_LOCK_INITIALIZER;
 
-static inline uint64_t __read_tohost(void) MUST_HOLD(&htif_lock)
+static inline uint64_t __read_tohost(void)
 {
 	return (htif_custom) ? *htif_tohost : tohost;
 }
 
-static inline void __write_tohost(uint64_t val) MUST_HOLD(&htif_lock)
+static inline void __write_tohost(uint64_t val)
 {
 	if (htif_custom)
 		*htif_tohost = val;
@@ -72,12 +69,12 @@ static inline void __write_tohost(uint64_t val) MUST_HOLD(&htif_lock)
 		tohost = val;
 }
 
-static inline uint64_t __read_fromhost(void) MUST_HOLD(&htif_lock)
+static inline uint64_t __read_fromhost(void)
 {
 	return (htif_custom) ? *htif_fromhost : fromhost;
 }
 
-static inline void __write_fromhost(uint64_t val) MUST_HOLD(&htif_lock)
+static inline void __write_fromhost(uint64_t val)
 {
 	if (htif_custom)
 		*htif_fromhost = val;
@@ -85,7 +82,7 @@ static inline void __write_fromhost(uint64_t val) MUST_HOLD(&htif_lock)
 		fromhost = val;
 }
 
-static void __check_fromhost() MUST_HOLD(&htif_lock)
+static void __check_fromhost()
 {
 	uint64_t fh = __read_fromhost();
 	if (!fh)
@@ -107,7 +104,6 @@ static void __check_fromhost() MUST_HOLD(&htif_lock)
 }
 
 static void __set_tohost(uint64_t dev, uint64_t cmd, uint64_t data)
-	MUST_HOLD(&htif_lock)
 {
 	while (__read_tohost())
 		__check_fromhost();
@@ -221,7 +217,7 @@ static int htif_system_reset_check(u32 type, u32 reason)
 	return 1;
 }
 
-static void htif_system_reset(u32 type, u32 reason) NO_THREAD_SAFETY_ANALYSIS
+static void htif_system_reset(u32 type, u32 reason)
 {
 	while (1) {
 		__write_fromhost(0);

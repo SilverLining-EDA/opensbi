@@ -29,39 +29,7 @@ static unsigned long tlb_fifo_off;
 static unsigned long tlb_fifo_mem_off;
 static unsigned long tlb_range_flush_limit;
 
-static void sbi_tlb_local_fence_i(struct sbi_tlb_info *tinfo);
-static void sbi_tlb_local_sfence_vma(struct sbi_tlb_info *tinfo);
-static void sbi_tlb_local_sfence_vma_asid(struct sbi_tlb_info *tinfo);
-static void sbi_tlb_local_hfence_gvma_vmid(struct sbi_tlb_info *tinfo);
-static void sbi_tlb_local_hfence_gvma(struct sbi_tlb_info *tinfo);
-static void sbi_tlb_local_hfence_vvma_asid(struct sbi_tlb_info *tinfo);
-static void sbi_tlb_local_hfence_vvma(struct sbi_tlb_info *tinfo);
-
-static struct sbi_tlb_local_operations default_tlb_local_ops = {
-	.local_fence_i = sbi_tlb_local_fence_i,
-	.local_sfence_vma = sbi_tlb_local_sfence_vma,
-	.local_sfence_vma_asid = sbi_tlb_local_sfence_vma_asid,
-	.local_hfence_gvma_vmid = sbi_tlb_local_hfence_gvma_vmid,
-	.local_hfence_gvma = sbi_tlb_local_hfence_gvma,
-	.local_hfence_vvma_asid = sbi_tlb_local_hfence_vvma_asid,
-	.local_hfence_vvma = sbi_tlb_local_hfence_vvma
-};
-
-static const struct sbi_tlb_local_operations *tlb_local_ops =
-	&default_tlb_local_ops;
-
-const struct sbi_tlb_local_operations *sbi_tlb_get_local_operations(void)
-{
-	return tlb_local_ops;
-}
-
-void sbi_tlb_set_local_operations(
-		const struct sbi_tlb_local_operations *ops)
-{
-	tlb_local_ops = ops;
-}
-
-void __sbi_sfence_vma_all(void)
+static void tlb_flush_all(void)
 {
 	__asm__ __volatile("sfence.vma");
 }
@@ -118,7 +86,7 @@ static void sbi_tlb_local_sfence_vma(struct sbi_tlb_info *tinfo)
 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_SFENCE_VMA_RCVD);
 
 	if ((start == 0 && size == 0) || (size == SBI_TLB_FLUSH_ALL)) {
-		__sbi_sfence_vma_all();
+		tlb_flush_all();
 		return;
 	}
 
@@ -215,25 +183,25 @@ static void tlb_entry_local_process(struct sbi_tlb_info *data)
 
 	switch (data->type) {
 	case SBI_TLB_FENCE_I:
-		tlb_local_ops->local_fence_i(data);
+		sbi_tlb_local_fence_i(data);
 		break;
 	case SBI_TLB_SFENCE_VMA:
-		tlb_local_ops->local_sfence_vma(data);
+		sbi_tlb_local_sfence_vma(data);
 		break;
 	case SBI_TLB_SFENCE_VMA_ASID:
-		tlb_local_ops->local_sfence_vma_asid(data);
+		sbi_tlb_local_sfence_vma_asid(data);
 		break;
 	case SBI_TLB_HFENCE_GVMA_VMID:
-		tlb_local_ops->local_hfence_gvma_vmid(data);
+		sbi_tlb_local_hfence_gvma_vmid(data);
 		break;
 	case SBI_TLB_HFENCE_GVMA:
-		tlb_local_ops->local_hfence_gvma(data);
+		sbi_tlb_local_hfence_gvma(data);
 		break;
 	case SBI_TLB_HFENCE_VVMA_ASID:
-		tlb_local_ops->local_hfence_vvma_asid(data);
+		sbi_tlb_local_hfence_vvma_asid(data);
 		break;
 	case SBI_TLB_HFENCE_VVMA:
-		tlb_local_ops->local_hfence_vvma(data);
+		sbi_tlb_local_hfence_vvma(data);
 		break;
 	default:
 		break;

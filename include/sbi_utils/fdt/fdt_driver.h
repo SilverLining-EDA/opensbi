@@ -18,9 +18,6 @@ struct fdt_driver {
 	bool experimental;
 };
 
-/* List of early FDT drivers generated at compile time */
-extern const struct fdt_driver *const fdt_early_drivers[];
-
 /**
  * Initialize a driver instance for a specific DT node
  *

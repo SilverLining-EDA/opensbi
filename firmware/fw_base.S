@@ -17,15 +17,6 @@
 #define BOOT_LOTTERY_ACQUIRED		1
 #define BOOT_STATUS_BOOT_HART_DONE	1
 
-/* OpenSBI firmware header */
-#define FW_HEADER_MAGIC_VALUE		0x4942534f /* ASCII string "OSBI" */
-#define FW_HEADER_VERSION		0x1
-#define FW_HEADER_SIZE			128
-#define FW_HEADER_RESERVED_OFFSET	0x38
-#define FW_HEADER_FLAGS_OVERRIDE_A0	(1 << 0) /* override a0 with mhartid */
-#define FW_HEADER_FLAGS_OVERRIDE_A1	(1 << 1)
-#define FW_HEADER_FLAGS_OVERRIDE_A2	(1 << 2)
-
 .macro	MOV_3R __d0, __s0, __d1, __s1, __d2, __s2
 	add	\__d0, \__s0, zero
 	add	\__d1, \__s1, zero
@@ -53,93 +44,10 @@
 	.section .entry, "ax", %progbits
 	.align 3
 	.globl _start
-	.globl _start_real
 	.globl _start_warm
 _start:
-	/*
-	 * OpenSBI firmware header
-	 *
-	 * Every OpenSBI firmware image starts with this fixed 128-byte
-	 * header. The layout is identical for RV32 and RV64 (and can be
-	 * extended for RV128 by using the reserved half of each override
-	 * field), so the previous booting stage can parse the header without
-	 * knowing the XLEN of the firmware upfront.
-	 *
-	 * Offset  Size  Field
-	 *   0x00     4  jump to _start_real
-	 *   0x04     4  magic ('OSBI')
-	 *   0x08     4  header version
-	 *   0x0c     4  firmware XLEN
-	 *   0x10     4  firmware size (_fw_end - _fw_start)
-	 *   0x14     4  flags (FW_HEADER_FLAGS_*)
-	 *   0x18     8  override value for a1
-	 *   0x20     8  reserved (upper half of the a1 value on RV128)
-	 *   0x28     8  override value for a2
-	 *   0x30     8  reserved (upper half of the a2 value on RV128)
-	 *   0x38    72  reserved
-	 */
-_fw_header_jump:
-	/*
-	 * Must stay a 4-byte instruction so that the fields below are always
-	 * at a fixed offset. 'norvc' keeps the assembler from picking c.j and
-	 * 'norelax' keeps the linker from compressing it later on, which it
-	 * would otherwise happily do for a jump this short.
-	 */
-	.option push
-	.option norvc
-	.option norelax
-	j	_start_real
-	.option pop
-_fw_header_magic:
-	.word	FW_HEADER_MAGIC_VALUE
-_fw_header_version:
-	.word	FW_HEADER_VERSION
-_fw_header_xlen:
-	.word	__riscv_xlen
-_fw_header_size:
-	.word	(_fw_end - _fw_start)
-_fw_header_flags:
-	.word	0
-_fw_header_override_a1:
-	.dword	0
-	.dword	0			/* reserved */
-_fw_header_override_a2:
-	.dword	0
-	.dword	0			/* reserved */
-	/* Reserved, pads the header up to FW_HEADER_SIZE bytes */
-	.fill	(FW_HEADER_SIZE - FW_HEADER_RESERVED_OFFSET), 1, 0
-_start_real:
-	/*
-	 * Override a0, a1 and a2 with the values from the firmware header.
-	 *
-	 * This is for a previous booting stage which cannot pass the boot
-	 * arguments in registers, but can patch the firmware image before
-	 * jumping to it. Nothing is overridden when the previous booting
-	 * stage left the flags word alone, so the registers passed by all
-	 * existing booting stages are used as-is.
-	 *
-	 * This runs before relocation, so only PC-relative addressing is
-	 * used. t0, t1 and t2 are free to use here: the boot arguments live
-	 * in a0-a4 and every other register is reset further down the cold
-	 * boot path.
-	 */
-	lla	t0, _fw_header_flags
-	lw	t0, (t0)
-	andi	t1, t0, FW_HEADER_FLAGS_OVERRIDE_A0
-	beqz	t1, _skip_override_a0
+	/* Previous stage did not pass hartid; CVA6 reset leaves a0 garbage. */
 	csrr	a0, CSR_MHARTID
-_skip_override_a0:
-	andi	t1, t0, FW_HEADER_FLAGS_OVERRIDE_A1
-	beqz	t1, _skip_override_a1
-	lla	t2, _fw_header_override_a1
-	REG_L	a1, (t2)
-_skip_override_a1:
-	andi	t1, t0, FW_HEADER_FLAGS_OVERRIDE_A2
-	beqz	t1, _skip_override_a2
-	lla	t2, _fw_header_override_a2
-	REG_L	a2, (t2)
-_skip_override_a2:
-
 	/* Find preferred boot HART id */
 	MOV_3R	s0, a0, s1, a1, s2, a2
 	call	fw_boot_hart
@@ -153,41 +61,31 @@ _try_lottery:
 	/* Jump to relocation wait loop if we don't get relocation lottery */
 	lla	a6, _boot_lottery
 	li	a7, BOOT_LOTTERY_ACQUIRED
-#if defined(__riscv_atomic) || defined(__riscv_zaamo)
-	amoswap.w a6, a7, (a6)
-	bnez	a6, _wait_for_boot_hart
-#elif defined(__riscv_zalrsc)
-_sc_fail:
-	lr.w	t0, (a6)
-	sc.w	t1, a7, (a6)
-	bnez	t1, _sc_fail
-	bnez	t0, _wait_for_boot_hart
-#else
-#error "need a or zalrsc"
-#endif
+	/* Single-hart CVA6 on HBM: amoswap.w never completes. */
+	sw	a7, 0(a6)
 
 	/* relocate the global table content */
 	li	t0, FW_TEXT_START	/* link start */
 	lla	t1, _fw_start		/* load start */
 	sub	t2, t1, t0		/* load offset */
-	lla	t0, __rela_dyn_start
-	lla	t1, __rela_dyn_end
+	lla	t0, __rel_dyn_start
+	lla	t1, __rel_dyn_end
 	beq	t0, t1, _relocate_done
 2:
-	REG_L	t5, __SIZEOF_LONG__(t0)	/* t5 <-- relocation info:type */
+	REG_L	t5, REGBYTES(t0)	/* t5 <-- relocation info:type */
 	li	t3, R_RISCV_RELATIVE	/* reloc type R_RISCV_RELATIVE */
 	bne	t5, t3, 3f
 	REG_L	t3, 0(t0)
-	REG_L	t5, (__SIZEOF_LONG__ * 2)(t0)	/* t5 <-- addend */
+	REG_L	t5, (REGBYTES * 2)(t0)	/* t5 <-- addend */
 	add	t5, t5, t2
 	add	t3, t3, t2
 	REG_S	t5, 0(t3)		/* store runtime address to the GOT entry */
 
 3:
-	addi	t0, t0, (__SIZEOF_LONG__ * 3)
+	addi	t0, t0, (REGBYTES * 3)
 	blt	t0, t1, 2b
 _relocate_done:
-	/* At this point we are running from load address */
+	/* At this point we are running from link address */
 
 	/* Reset all registers except ra, a0, a1, a2, a3 and a4 for boot HART */
 	li	ra, 0
@@ -328,10 +226,9 @@ _scratch_init:
 	/* Store hartid-to-scratch function address in scratch space */
 	lla	a4, _hartid_to_scratch
 	REG_S	a4, SBI_SCRATCH_HARTID_TO_SCRATCH_OFFSET(tp)
-	/* Clear trap_context, tmp0 and tmp1 in scratch space */
+	/* Clear trap_context and tmp0 in scratch space */
 	REG_S	zero, SBI_SCRATCH_TRAP_CONTEXT_OFFSET(tp)
 	REG_S	zero, SBI_SCRATCH_TMP0_OFFSET(tp)
-	REG_S	zero, SBI_SCRATCH_TMP1_OFFSET(tp)
 	/* Store firmware options in scratch space */
 	MOV_3R	s0, a0, s1, a1, s2, a2
 #ifdef FW_OPTIONS
@@ -397,7 +294,7 @@ _fdt_reloc_done:
 	REG_S	t0, 0(t1)
 	j	_start_warm
 
-	/* waiting for boot hart to be done (_boot_status == BOOT_STATUS_BOOT_HART_DONE) */
+	/* waiting for boot hart to be done (_boot_status == 2) */
 _wait_for_boot_hart:
 	li	t0, BOOT_STATUS_BOOT_HART_DONE
 	lla	t1, _boot_status
@@ -599,45 +496,6 @@ memcmp:
 	csrrw	tp, CSR_MSCRATCH, tp
 .endm
 
-.macro	TRAP_SAVE_AND_SETUP_SP_T0_NMI
-	/* Swap TP and MNSCRATCH (for RNMI) */
-	csrrw	tp, CSR_MNSCRATCH, tp
-
-	/* Save T0 in scratch space */
-	REG_S	t0, SBI_SCRATCH_TMP1_OFFSET(tp)
-
-	/*
-	 * Set T0 to appropriate exception stack
-	 *
-	 * Came_From_M_Mode = ((MNSTATUS.MNPP < PRV_M) ? 1 : 0) - 1;
-	 * Exception_Stack = TP ^ (Came_From_M_Mode & (SP ^ TP))
-	 */
-	csrr	t0, CSR_MNSTATUS
-	srl	t0, t0, 11		/* MNPP is at bits 11-12 */
-	and	t0, t0, PRV_M
-	slti	t0, t0, PRV_M
-	add	t0, t0, -1
-	xor	sp, sp, tp
-	and	t0, t0, sp
-	xor	sp, sp, tp
-	xor	t0, tp, t0
-
-	/* Save original SP on exception stack */
-	REG_S	sp, (SBI_TRAP_REGS_OFFSET(sp) - SBI_TRAP_CONTEXT_SIZE)(t0)
-
-	/* Set SP to exception stack and make room for trap context */
-	add	sp, t0, -(SBI_TRAP_CONTEXT_SIZE)
-
-	/* Restore T0 from scratch space */
-	REG_L	t0, SBI_SCRATCH_TMP1_OFFSET(tp)
-
-	/* Save T0 on stack */
-	REG_S	t0, SBI_TRAP_REGS_OFFSET(t0)(sp)
-
-	/* Swap TP and MNSCRATCH */
-	csrrw	tp, CSR_MNSCRATCH, tp
-.endm
-
 .macro	TRAP_SAVE_MEPC_MSTATUS have_mstatush
 	/* Save MEPC and MSTATUS CSRs */
 	csrr	t0, CSR_MEPC
@@ -650,20 +508,6 @@ memcmp:
 	.else
 	REG_S	zero, SBI_TRAP_REGS_OFFSET(mstatusH)(sp)
 	.endif
-.endm
-
-.macro	TRAP_SAVE_MNEPC_MNSTATUS have_mstatush
-	/*
-	 * Save MNEPC and MNSTATUS CSRs (for RNMI)
-	 * Note: Trap context structure has generic field names (mepc, mstatus),
-	 * we store MN* CSR values into these same structure fields.
-	 */
-	csrr	t0, CSR_MNEPC
-	REG_S	t0, SBI_TRAP_REGS_OFFSET(mepc)(sp)
-	csrr	t0, CSR_MNSTATUS
-	REG_S	t0, SBI_TRAP_REGS_OFFSET(mstatus)(sp)
-	/* MNSTATUSH doesn't exist in SMRNMI spec */
-	REG_S	zero, SBI_TRAP_REGS_OFFSET(mstatusH)(sp)
 .endm
 
 .macro	TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0
@@ -729,34 +573,10 @@ memcmp:
 	CLEAR_MDT t0
 .endm
 
-.macro	TRAP_SAVE_NMI_INFO
-	/*
-	 * Save NMI trap info (MNCAUSE, no MNTVAL in spec)
-	 * Note: Trap info structure has generic field names (cause, tval, etc.),
-	 * we store MN* CSR values into these same structure fields.
-	 */
-	csrr	t0, CSR_MNCAUSE
-	REG_S	t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(cause))(sp)
-	/* MNTVAL doesn't exist in SMRNMI spec */
-	REG_S	zero, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(tval))(sp)
-	REG_S	zero, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(tval2))(sp)
-	REG_S	zero, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(tinst))(sp)
-	REG_S	zero, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(gva))(sp)
-
-	/* We are ready to take another trap, clear MDT */
-	CLEAR_MDT t0
-.endm
-
 .macro	TRAP_CALL_C_ROUTINE
 	/* Call C routine */
 	add	a0, sp, zero
 	call	sbi_trap_handler
-.endm
-
-.macro	TRAP_CALL_C_RNMI_ROUTINE
-	/* Call C routine */
-	add	a0, sp, zero
-	call	sbi_trap_rnmi_handler
 .endm
 
 .macro	TRAP_RESTORE_GENERAL_REGS_EXCEPT_A0_T0
@@ -805,19 +625,6 @@ memcmp:
 	csrw	CSR_MSTATUS, t0
 	REG_L	t0, SBI_TRAP_REGS_OFFSET(mepc)(a0)
 	csrw	CSR_MEPC, t0
-.endm
-
-.macro	TRAP_RESTORE_MNEPC_MNSTATUS
-	/*
-	 * Restore MNSTATUS and MNEPC CSRs (for RNMI)
-	 * Note: Load from generic structure fields (mstatus, mepc) and
-	 * restore to NMI-specific CSRs (MNSTATUS, MNEPC).
-	 * No MNSTATUSH in SMRNMI spec.
-	 */
-	REG_L	t0, SBI_TRAP_REGS_OFFSET(mstatus)(a0)
-	csrw	CSR_MNSTATUS, t0
-	REG_L	t0, SBI_TRAP_REGS_OFFSET(mepc)(a0)
-	csrw	CSR_MNEPC, t0
 .endm
 
 .macro TRAP_RESTORE_A0_T0
@@ -886,37 +693,6 @@ _trap_handler_hyp:
 
 	.section .entry, "ax", %progbits
 	.align 3
-	.globl _trap_rnmi_handler
-_trap_rnmi_handler:
-	/*
-	 * NMI interrupt handler using MN* CSRs
-	 *
-	 * Context detection via MNPP (previous privilege mode):
-	 * - If MNPP < M-mode: use exception stack (TP)
-	 * - If MNPP == M-mode: use current stack (SP)
-	 * This handles nested interrupt cases.
-	 */
-	TRAP_SAVE_AND_SETUP_SP_T0_NMI
-
-	TRAP_SAVE_MNEPC_MNSTATUS 0
-
-	TRAP_SAVE_GENERAL_REGS_EXCEPT_SP_T0
-
-	TRAP_SAVE_NMI_INFO
-
-	TRAP_CALL_C_RNMI_ROUTINE
-
-	TRAP_RESTORE_GENERAL_REGS_EXCEPT_A0_T0
-
-	TRAP_RESTORE_MNEPC_MNSTATUS
-
-	TRAP_RESTORE_A0_T0
-
-	/* mnret - return from NMI (SMRNMI extension) */
-	.word 0x70200073
-
-	.section .entry, "ax", %progbits
-	.align 3
 	.globl _reset_regs
 _reset_regs:
 
@@ -951,19 +727,6 @@ _reset_regs:
 	csrw CSR_MSCRATCH, 0
 
 	ret
-
-	.section .rodata
-.Lstack_corrupt_msg:
-	.string "stack smashing detected\n"
-
-	/* This will be called when the stack corruption is detected */
-	.section .text
-	.align 3
-	.globl __stack_chk_fail
-	.type __stack_chk_fail, %function
-__stack_chk_fail:
-	la	a0, .Lstack_corrupt_msg
-	call	sbi_panic
 
 #ifdef FW_FDT_PATH
 	.section .rodata

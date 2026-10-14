@@ -4,7 +4,6 @@
 static spinlock_t test_lock = SPIN_LOCK_INITIALIZER;
 
 static void spin_lock_test(struct sbiunit_test_case *test)
-	NO_THREAD_SAFETY_ANALYSIS
 {
 	/* We don't want to accidentally get locked */
 	SBIUNIT_ASSERT(test, !spin_lock_check(&test_lock));
@@ -17,7 +16,6 @@ static void spin_lock_test(struct sbiunit_test_case *test)
 }
 
 static void spin_trylock_fail(struct sbiunit_test_case *test)
-	NO_THREAD_SAFETY_ANALYSIS
 {
 	/* We don't want to accidentally get locked */
 	SBIUNIT_ASSERT(test, !spin_lock_check(&test_lock));
@@ -28,7 +26,6 @@ static void spin_trylock_fail(struct sbiunit_test_case *test)
 }
 
 static void spin_trylock_success(struct sbiunit_test_case *test)
-	NO_THREAD_SAFETY_ANALYSIS
 {
 	SBIUNIT_EXPECT(test, spin_trylock(&test_lock));
 	spin_unlock(&test_lock);

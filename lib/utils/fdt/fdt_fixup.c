@@ -16,7 +16,6 @@
 #include <sbi/sbi_scratch.h>
 #include <sbi/sbi_string.h>
 #include <sbi/sbi_error.h>
-#include <sbi/sbi_timer.h>
 #include <sbi_utils/fdt/fdt_fixup.h>
 #include <sbi_utils/fdt/fdt_pmu.h>
 #include <sbi_utils/fdt/fdt_helper.h>
@@ -106,128 +105,41 @@ int fdt_add_cpu_idle_states(void *fdt, const struct sbi_cpu_idle_state *state)
 	return 0;
 }
 
-/**
- * Report which fixups a HART DT node needs. Read-only, so the sizing pass
- * and the fixup pass below stay in sync by construction.
- */
-static void fdt_cpu_fixup_needed(const void *fdt, int cpu_offset,
-				 bool emulated_zicntr, bool *disable,
-				 bool *add_zicntr)
-{
-	struct sbi_domain *dom = sbi_domain_thishart_ptr();
-	const char *mmu_type, *extensions;
-	u32 hartid, hartindex;
-	int len;
-
-	*disable = false;
-	*add_zicntr = false;
-
-	if (fdt_parse_hart_id(fdt, cpu_offset, &hartid))
-		return;
-
-	if (!fdt_node_is_enabled(fdt, cpu_offset))
-		return;
-
-	/*
-	 * Disable a HART DT node if one of the following is true:
-	 * 1. The HART is not assigned to the current domain
-	 * 2. MMU is not available for the HART
-	 */
-
-	hartindex = sbi_hartid_to_hartindex(hartid);
-	mmu_type = fdt_getprop(fdt, cpu_offset, "mmu-type", &len);
-	if (!sbi_domain_is_assigned_hart(dom, hartindex) || !mmu_type || !len)
-		*disable = true;
-
-	if (!emulated_zicntr)
-		return;
-
-	extensions = fdt_getprop(fdt, cpu_offset, "riscv,isa-extensions", &len);
-	/*
-	 * For legacy devicetrees, don't create riscv,isa-extensions
-	 * property if there hasn't been already one.
-	 */
-	if (extensions && !fdt_stringlist_contains(extensions, len, "zicntr"))
-		*add_zicntr = true;
-}
-
 void fdt_cpu_fixup(void *fdt)
 {
-	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
-	bool emulated_zicntr, disable, add_zicntr;
-	int err, cpu_offset, cpus_offset;
-	int reserve = 0;
-	/*
-	 * A new "status" property costs a header, its tag-aligned value and its
-	 * name; appending "zicntr" only grows an existing tag-aligned value.
-	 */
-	const int status_size = sizeof(struct fdt_property) +
-				ROUNDUP(sizeof("disabled"), FDT_TAGSIZE) +
-				sizeof("status");
-	const int zicntr_size = ROUNDUP(sizeof("zicntr"), FDT_TAGSIZE);
+	struct sbi_domain *dom = sbi_domain_thishart_ptr();
+	int err, cpu_offset, cpus_offset, len;
+	const char *mmu_type;
+	u32 hartid, hartindex;
 
-	/*
-	 * Claim Zicntr extension in riscv,isa-extensions if
-	 *  1. OpenSBI can emulate time CSR with a timer
-	 *  2. The other two CSRs specified by Zicntr are available
-	 */
-	emulated_zicntr = sbi_timer_get_device() != NULL &&
-			  sbi_hart_has_csr(scratch, SBI_HART_CSR_CYCLE) &&
-			  sbi_hart_has_csr(scratch, SBI_HART_CSR_INSTRET);
-
-	cpus_offset = fdt_path_offset(fdt, "/cpus");
-	if (cpus_offset < 0)
-		return;
-
-	/*
-	 * fdt_open_into() trusts the size it is given, so reserve only what is
-	 * really needed instead of a fixed worst case for every possible HART.
-	 */
-	fdt_for_each_subnode(cpu_offset, fdt, cpus_offset) {
-		fdt_cpu_fixup_needed(fdt, cpu_offset, emulated_zicntr,
-				     &disable, &add_zicntr);
-		if (disable)
-			reserve += status_size;
-		if (add_zicntr)
-			reserve += zicntr_size;
-	}
-
-	if (!reserve)
-		return;
-
-	err = fdt_open_into(fdt, fdt, fdt_totalsize(fdt) + reserve);
+	err = fdt_open_into(fdt, fdt, fdt_totalsize(fdt) + 32);
 	if (err < 0)
 		return;
 
-	/* fdt_open_into() may have reordered the blocks, so look up again. */
 	cpus_offset = fdt_path_offset(fdt, "/cpus");
 	if (cpus_offset < 0)
 		return;
 
 	fdt_for_each_subnode(cpu_offset, fdt, cpus_offset) {
-		fdt_cpu_fixup_needed(fdt, cpu_offset, emulated_zicntr,
-				     &disable, &add_zicntr);
+		err = fdt_parse_hart_id(fdt, cpu_offset, &hartid);
+		if (err)
+			continue;
 
-		if (disable) {
-			err = fdt_setprop_string(fdt, cpu_offset, "status",
-						 "disabled");
-			if (err)
-				sbi_printf("%s: failed to disable %s (%d)\n",
-					   __func__,
-					   fdt_get_name(fdt, cpu_offset, NULL),
-					   err);
-		}
+		if (!fdt_node_is_enabled(fdt, cpu_offset))
+			continue;
 
-		if (add_zicntr) {
-			err = fdt_appendprop_string(fdt, cpu_offset,
-						    "riscv,isa-extensions",
-						    "zicntr");
-			if (err)
-				sbi_printf("%s: failed to add zicntr to %s (%d)\n",
-					   __func__,
-					   fdt_get_name(fdt, cpu_offset, NULL),
-					   err);
-		}
+		/*
+		 * Disable a HART DT node if one of the following is true:
+		 * 1. The HART is not assigned to the current domain
+		 * 2. MMU is not available for the HART
+		 */
+
+		hartindex = sbi_hartid_to_hartindex(hartid);
+		mmu_type = fdt_getprop(fdt, cpu_offset, "mmu-type", &len);
+		if (!sbi_domain_is_assigned_hart(dom, hartindex) ||
+		    !mmu_type || !len)
+			fdt_setprop_string(fdt, cpu_offset, "status",
+					   "disabled");
 	}
 }
 
@@ -242,7 +154,7 @@ static void fdt_domain_based_fixup_one(void *fdt, int nodeoff)
 		return;
 
 	if (!sbi_domain_check_addr(dom, reg_addr, dom->next_mode,
-				    SBI_DOMAIN_READ | SBI_DOMAIN_WRITE | SBI_DOMAIN_MMIO)) {
+				    SBI_DOMAIN_READ | SBI_DOMAIN_WRITE)) {
 		rc = fdt_open_into(fdt, fdt, fdt_totalsize(fdt) + 32);
 		if (rc < 0)
 			return;
@@ -503,6 +415,7 @@ int fdt_register_general_fixup(struct fdt_general_fixup *fixup)
 			return SBI_EALREADY;
 	}
 
+	SBI_INIT_LIST_HEAD(&fixup->head);
 	sbi_list_add_tail(&fixup->head, &fixup_list);
 
 	return 0;

@@ -15,7 +15,7 @@
 #include <sbi/sbi_types.h>
 #include <sbi/sbi_hartmask.h>
 #include <sbi/sbi_domain_context.h>
-#include <sbi/sbi_domain_state.h>
+#include <sbi/sbi_domain_data.h>
 
 struct sbi_scratch;
 
@@ -121,9 +121,6 @@ struct sbi_domain_memregion {
 		((__flags & SBI_DOMAIN_MEMREGION_SU_ACCESS_MASK)  &&	\
 		 !(__flags & SBI_DOMAIN_MEMREGION_M_ACCESS_MASK))
 
-#define SBI_DOMAIN_MEMREGION_IS_FIRMWARE(__flags)			\
-		((__flags & SBI_DOMAIN_MEMREGION_FW) ? true : false)	\
-
 /** Bit to control if permissions are enforced on all modes */
 #define SBI_DOMAIN_MEMREGION_ENF_PERMISSIONS	(1UL << 6)
 
@@ -160,47 +157,23 @@ struct sbi_domain_memregion {
 				 SBI_DOMAIN_MEMREGION_M_EXECUTABLE)
 
 #define SBI_DOMAIN_MEMREGION_MMIO		(1UL << 31)
-#define SBI_DOMAIN_MEMREGION_FW			(1UL << 30)
 	unsigned long flags;
 };
-
-/** Check if regionA is sub-region of regionB */
-static inline bool sbi_domain_memregion_is_subset(
-				const struct sbi_domain_memregion *regA,
-				const struct sbi_domain_memregion *regB)
-{
-	ulong regA_start = regA->base;
-	ulong regA_mask = (regA->order >= __riscv_xlen) ? ~0UL : (BIT(regA->order) - 1);
-	ulong regA_end = regA_start + regA_mask;
-	ulong regB_start = regB->base;
-	ulong regB_mask = (regB->order >= __riscv_xlen) ? ~0UL : (BIT(regB->order) - 1);
-	ulong regB_end = regB_start + regB_mask;
-
-	if ((regB_start <= regA_start) &&
-	    (regA_start < regB_end) &&
-	    (regB_start < regA_end) &&
-	    (regA_end <= regB_end))
-		return true;
-
-	return false;
-}
 
 /** Representation of OpenSBI domain */
 struct sbi_domain {
 	/** Node in linked list of domains */
 	struct sbi_dlist node;
-	/** Internal per-domain state areas */
-	struct sbi_domain_state_priv state_priv;
+	/** Internal state of per-domain data */
+	struct sbi_domain_data_priv data_priv;
 	/** Logical index of this domain */
 	u32 index;
+	/** HARTs assigned to this domain */
+	struct sbi_hartmask assigned_harts;
 	/** Spinlock for accessing assigned_harts */
 	spinlock_t assigned_harts_lock;
-	/** HARTs assigned to this domain */
-	struct sbi_hartmask assigned_harts GUARDED_BY(&assigned_harts_lock);
 	/** Name of this domain */
 	char name[64];
-	/** Initialization order of this domain */
-	u32 init_order;
 	/** Possible HARTs in this domain */
 	const struct sbi_hartmask *possible_harts;
 	/** Array of memory regions terminated by a region with order zero */
@@ -245,17 +218,13 @@ extern struct sbi_dlist domain_list;
 #define sbi_domain_for_each_memregion(__d, __r) \
 	for ((__r) = (__d)->regions; (__r)->order; (__r)++)
 
-#define sbi_domain_for_each_memregion_idx(__d, __r, __i) \
-	for ((__r) = (__d)->regions, (__i) = 0; (__r)->order; (__r)++, (__i)++)
-
 /**
  * Check whether given HART is assigned to specified domain
  * @param dom pointer to domain
  * @param hartindex the HART index
  * @return true if HART is assigned to domain otherwise false
  */
-bool sbi_domain_is_assigned_hart(const struct sbi_domain *dom, u32 hartindex)
-	MUST_NOT_HOLD(&dom->assigned_harts_lock);
+bool sbi_domain_is_assigned_hart(const struct sbi_domain *dom, u32 hartindex);
 
 /**
  * Get the assigned HART mask for given domain
@@ -264,8 +233,7 @@ bool sbi_domain_is_assigned_hart(const struct sbi_domain *dom, u32 hartindex)
  * @return 0 on success and SBI_Exxx (< 0) on failure
  */
 int sbi_domain_get_assigned_hartmask(const struct sbi_domain *dom,
-				     struct sbi_hartmask *mask)
-	MUST_NOT_HOLD(&dom->assigned_harts_lock);
+				     struct sbi_hartmask *mask);
 
 /**
  * Initialize a domain memory region based on it's physical
@@ -280,20 +248,6 @@ void sbi_domain_memregion_init(unsigned long addr,
 				unsigned long size,
 				unsigned long flags,
 				struct sbi_domain_memregion *reg);
-
-/**
- * Return the oldpmp pmpcfg LRWX encoding for the flags in @reg.
- *
- * @param reg pointer to memory region; its flags field encodes permissions.
- */
-unsigned int sbi_domain_get_oldpmp_flags(struct sbi_domain_memregion *reg);
-
-/**
- * Return the Smepmp pmpcfg LRWX encoding for the flags in @reg.
- *
- * @param reg pointer to memory region; its flags field encodes permissions.
- */
-unsigned int sbi_domain_get_smepmp_flags(struct sbi_domain_memregion *reg);
 
 /**
  * Check whether we can access specified address for given mode and
@@ -332,10 +286,12 @@ void sbi_domain_dump_all(const char *suffix);
 /**
  * Register a new domain
  * @param dom pointer to domain
+ * @param assign_mask pointer to HART mask of HARTs assigned to the domain
  *
  * @return 0 on success and negative error code on failure
  */
-int sbi_domain_register(struct sbi_domain *dom);
+int sbi_domain_register(struct sbi_domain *dom,
+			const struct sbi_hartmask *assign_mask);
 
 /**
  * Add a memory range with its flags to the root domain
@@ -351,11 +307,8 @@ int sbi_domain_register(struct sbi_domain *dom);
 int sbi_domain_root_add_memrange(unsigned long addr, unsigned long size,
 			   unsigned long align, unsigned long region_flags);
 
-/** Startup non-root domains */
-int sbi_domain_startup(struct sbi_scratch *scratch, u32 cold_hartid);
-
-/** Finalize domain tables */
-int sbi_domain_finalize(struct sbi_scratch *scratch);
+/** Finalize domain tables and startup non-root domains */
+int sbi_domain_finalize(struct sbi_scratch *scratch, u32 cold_hartid);
 
 /** Initialize domains */
 int sbi_domain_init(struct sbi_scratch *scratch, u32 cold_hartid);

@@ -90,8 +90,7 @@ int sbi_emulate_csr_read(int csr_num, struct sbi_trap_regs *regs,
 		*csr_val = csr_read(CSR_MCYCLEH);
 		break;
 	case CSR_TIMEH:
-		if (!hpm_allowed(csr_num - CSR_CYCLEH, prev_mode, virt))
-			return SBI_ENOTSUPP;
+		/* Refer comments on TIME CSR above. */
 		*csr_val = (virt) ? sbi_timer_virt_value() >> 32:
 				    sbi_timer_value() >> 32;
 		break;

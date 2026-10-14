@@ -11,7 +11,6 @@
 #include <sbi/riscv_encoding.h>
 #include <sbi/sbi_bitops.h>
 #include <sbi/sbi_console.h>
-#include <sbi/sbi_double_trap.h>
 #include <sbi/sbi_ecall.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hart.h>
@@ -20,7 +19,6 @@
 #include <sbi/sbi_irqchip.h>
 #include <sbi/sbi_trap_ldst.h>
 #include <sbi/sbi_pmu.h>
-#include <sbi/sbi_platform.h>
 #include <sbi/sbi_scratch.h>
 #include <sbi/sbi_sse.h>
 #include <sbi/sbi_timer.h>
@@ -170,7 +168,7 @@ int sbi_trap_redirect(struct sbi_trap_regs *regs,
 		csr_write(CSR_VSCAUSE, trap->cause);
 
 		/* Set MEPC to VS-mode exception vector base */
-		regs->mepc = csr_read(CSR_VSTVEC) & ~MTVEC_MODE;
+		regs->mepc = csr_read(CSR_VSTVEC);
 
 		/* Set MPP to VS-mode */
 		regs->mstatus &= ~MSTATUS_MPP;
@@ -205,7 +203,7 @@ int sbi_trap_redirect(struct sbi_trap_regs *regs,
 		csr_write(CSR_SCAUSE, trap->cause);
 
 		/* Set MEPC to S-mode exception vector base */
-		regs->mepc = csr_read(CSR_STVEC) & ~MTVEC_MODE;
+		regs->mepc = csr_read(CSR_STVEC);
 
 		/* Set MPP to S-mode */
 		regs->mstatus &= ~MSTATUS_MPP;
@@ -241,13 +239,12 @@ static int sbi_trap_nonaia_irq(unsigned long irq)
 	case IRQ_M_SOFT:
 		sbi_ipi_process();
 		break;
+	case IRQ_PMU_OVF:
+		sbi_pmu_ovf_irq();
+		break;
 	case IRQ_M_EXT:
 		return sbi_irqchip_process();
 	default:
-		if (irq == sbi_pmu_irq_bit()) {
-			sbi_pmu_ovf_irq();
-			return 0;
-		}
 		return SBI_ENOENT;
 	}
 
@@ -268,17 +265,15 @@ static int sbi_trap_aia_irq(void)
 		case IRQ_M_SOFT:
 			sbi_ipi_process();
 			break;
+		case IRQ_PMU_OVF:
+			sbi_pmu_ovf_irq();
+			break;
 		case IRQ_M_EXT:
 			rc = sbi_irqchip_process();
 			if (rc)
 				return rc;
 			break;
 		default:
-			if (mtopi == sbi_pmu_irq_bit()) {
-				sbi_pmu_ovf_irq();
-				break;
-			}
-
 			return SBI_ENOENT;
 		}
 	}
@@ -375,89 +370,4 @@ trap_done:
 
 	sbi_trap_set_context(scratch, tcntx->prev_context);
 	return tcntx;
-}
-
-/**
- * Default Resumable NMI (RNMI) handler
- *
- * This function is called from the _trap_rnmi_handler assembly code.
- * It provides a simple wrapper that calls the platform-specific
- * NMI handler if registered. If no handler is registered, it prints
- * diagnostic information and hangs, similar to unhandled traps.
- *
- * Note: The trap context stores NMI CSR values (MNCAUSE, MNEPC, MNSTATUS)
- * in the generic trap context fields (cause, mepc, mstatus).
- *
- * @param tcntx Pointer to trap context (saved on stack)
- * @return Same trap context pointer (needed for restore macros)
- */
-struct sbi_trap_context *sbi_trap_rnmi_handler(struct sbi_trap_context *tcntx)
-{
-	int rc;
-	const struct sbi_platform *plat = sbi_platform_thishart_ptr();
-	const struct sbi_platform_operations *ops = sbi_platform_ops(plat);
-
-	/* Call platform-specific NMI handler if registered */
-	if (ops && ops->rnmi_handler) {
-		rc = ops->rnmi_handler(tcntx);
-		if (rc) {
-			/* Platform handler failed to handle NMI */
-			sbi_trap_error("platform NMI handler failed", rc, tcntx);
-		}
-		return tcntx;
-	}
-
-	/* No platform handler - treat as unhandled NMI */
-	sbi_trap_error("unhandled NMI (no platform rnmi_handler)",
-		       SBI_ENOTSUPP, tcntx);
-
-	/* Never returns */
-	return tcntx;
-}
-
-static int delegate_traps(struct sbi_scratch *scratch)
-{
-	const struct sbi_platform *plat = sbi_platform_ptr(scratch);
-	unsigned long interrupts, exceptions;
-
-	if (!misa_extension('S'))
-		/* No delegation possible as mideleg does not exist */
-		return 0;
-
-	/* Send M-mode interrupts and most exceptions to S-mode */
-	interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
-	interrupts |= sbi_pmu_irq_mask();
-
-	exceptions = (1U << CAUSE_MISALIGNED_FETCH) | (1U << CAUSE_BREAKPOINT) |
-		     (1U << CAUSE_USER_ECALL);
-	if (sbi_platform_has_mfaults_delegation(plat))
-		exceptions |= (1U << CAUSE_FETCH_PAGE_FAULT) |
-			      (1U << CAUSE_LOAD_PAGE_FAULT) |
-			      (1U << CAUSE_STORE_PAGE_FAULT) |
-			      (1U << CAUSE_SW_CHECK_EXCP);
-
-	/*
-	 * If hypervisor extension available then we only handle hypervisor
-	 * calls (i.e. ecalls from HS-mode) in M-mode.
-	 *
-	 * The HS-mode will additionally handle supervisor calls (i.e. ecalls
-	 * from VS-mode), Guest page faults and Virtual interrupts.
-	 */
-	if (misa_extension('H')) {
-		exceptions |= (1U << CAUSE_VIRTUAL_SUPERVISOR_ECALL);
-		exceptions |= (1U << CAUSE_FETCH_GUEST_PAGE_FAULT);
-		exceptions |= (1U << CAUSE_LOAD_GUEST_PAGE_FAULT);
-		exceptions |= (1U << CAUSE_VIRTUAL_INST_FAULT);
-		exceptions |= (1U << CAUSE_STORE_GUEST_PAGE_FAULT);
-	}
-
-	csr_write(CSR_MIDELEG, interrupts);
-	csr_write(CSR_MEDELEG, exceptions);
-
-	return 0;
-}
-
-int sbi_trap_init(struct sbi_scratch *scratch, bool cold_boot)
-{
-	return delegate_traps(scratch);
 }

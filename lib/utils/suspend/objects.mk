@@ -7,11 +7,8 @@
 #   Anup Patel <apatel@ventanamicro.com>
 #
 
-carray-fdt_early_drivers-$(CONFIG_FDT_SUSPEND_ANDES_ATCSMU) += fdt_suspend_andes_atcsmu
-libsbiutils-objs-$(CONFIG_FDT_SUSPEND_ANDES_ATCSMU) += suspend/fdt_suspend_andes_atcsmu.o
+libsbiutils-objs-$(CONFIG_FDT_SUSPEND) += suspend/fdt_suspend.o
+libsbiutils-objs-$(CONFIG_FDT_SUSPEND) += suspend/fdt_suspend_drivers.carray.o
 
-carray-fdt_early_drivers-$(CONFIG_FDT_SUSPEND_RPMI) += fdt_suspend_rpmi
+carray-fdt_suspend_drivers-$(CONFIG_FDT_SUSPEND_RPMI) += fdt_suspend_rpmi
 libsbiutils-objs-$(CONFIG_FDT_SUSPEND_RPMI) += suspend/fdt_suspend_rpmi.o
-
-carray-fdt_early_drivers-$(CONFIG_FDT_SUSPEND_SIFIVE_SMC0) += fdt_suspend_sifive_smc0
-libsbiutils-objs-$(CONFIG_FDT_SUSPEND_SIFIVE_SMC0) += suspend/fdt_suspend_sifive_smc0.o

@@ -12,6 +12,7 @@
 #include <sbi/riscv_io.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_heap.h>
+#include <sbi/sbi_platform.h>
 #include <sbi/sbi_scratch.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/irqchip/fdt_irqchip.h>
@@ -23,11 +24,6 @@ static int irqchip_plic_update_context_map(const void *fdt, int nodeoff,
 	const fdt32_t *val;
 	u32 phandle, hwirq, hartid, hartindex;
 	int i, err, count, cpu_offset, cpu_intc_offset;
-
-	for (i = 0; i < sbi_hart_count(); i++) {
-		pd->context_map[i][PLIC_M_CONTEXT] = -1;
-		pd->context_map[i][PLIC_S_CONTEXT] = -1;
-	}
 
 	val = fdt_getprop(fdt, nodeoff, "interrupts-extended", &count);
 	if (!val || count < sizeof(fdt32_t))
@@ -70,10 +66,12 @@ static int irqchip_plic_update_context_map(const void *fdt, int nodeoff,
 static int irqchip_plic_cold_init(const void *fdt, int nodeoff,
 				  const struct fdt_match *match)
 {
+	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
+	const struct sbi_platform *plat = sbi_platform_ptr(scratch);
 	int rc;
 	struct plic_data *pd;
 
-	pd = sbi_zalloc(PLIC_DATA_SIZE(sbi_hart_count()));
+	pd = sbi_zalloc(PLIC_DATA_SIZE(plat->hart_count));
 	if (!pd)
 		return SBI_ENOMEM;
 
@@ -107,7 +105,7 @@ static const struct fdt_match irqchip_plic_match[] = {
 	{ /* sentinel */ }
 };
 
-const struct fdt_driver fdt_irqchip_plic = {
+struct fdt_irqchip fdt_irqchip_plic = {
 	.match_table = irqchip_plic_match,
-	.init = irqchip_plic_cold_init,
+	.cold_init = irqchip_plic_cold_init,
 };

@@ -135,8 +135,8 @@ void plic_suspend(void)
 	if (!data_word)
 		return;
 
-	sbi_for_each_hartindex(h) {
-		s16 context_id = plic->context_map[h][PLIC_S_CONTEXT];
+	for (u32 h = 0; h <= sbi_scratch_last_hartindex(); h++) {
+		u32 context_id = plic->context_map[h][PLIC_S_CONTEXT];
 
 		if (context_id < 0)
 			continue;
@@ -166,8 +166,8 @@ void plic_resume(void)
 	if (!data_word)
 		return;
 
-	sbi_for_each_hartindex(h) {
-		s16 context_id = plic->context_map[h][PLIC_S_CONTEXT];
+	for (u32 h = 0; h <= sbi_scratch_last_hartindex(); h++) {
+		u32 context_id = plic->context_map[h][PLIC_S_CONTEXT];
 
 		if (context_id < 0)
 			continue;
@@ -236,7 +236,7 @@ int plic_cold_irqchip_init(struct plic_data *plic)
 	if (plic->flags & PLIC_FLAG_ENABLE_PM) {
 		unsigned long data_size = 0;
 
-		sbi_for_each_hartindex(i) {
+		for (u32 i = 0; i <= sbi_scratch_last_hartindex(); i++) {
 			if (plic->context_map[i][PLIC_S_CONTEXT] < 0)
 				continue;
 
@@ -270,18 +270,17 @@ int plic_cold_irqchip_init(struct plic_data *plic)
 	if (ret)
 		return ret;
 
-	sbi_for_each_hartindex(i) {
+	for (u32 i = 0; i <= sbi_scratch_last_hartindex(); i++) {
 		if (plic->context_map[i][PLIC_M_CONTEXT] < 0 &&
 		    plic->context_map[i][PLIC_S_CONTEXT] < 0)
 			continue;
 
 		plic_set_hart_data_ptr(sbi_hartindex_to_scratch(i), plic);
-		sbi_hartmask_set_hartindex(i, &plic->irqchip.target_harts);
 	}
 
 	/* Register irqchip device */
-	plic->irqchip.id = plic->unique_id;
-	plic->irqchip.num_hwirq = plic->num_src + 1;
 	plic->irqchip.warm_init = plic_warm_irqchip_init;
-	return sbi_irqchip_add_device(&plic->irqchip);
+	sbi_irqchip_add_device(&plic->irqchip);
+
+	return 0;
 }

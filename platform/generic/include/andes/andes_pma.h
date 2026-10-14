@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Copyright (C) 2023 Renesas Electronics Corp.
  */
@@ -19,7 +19,6 @@
 #define ANDES_PMACFG_ETYP_NAPOT			(3 << ANDES_PMACFG_ETYP_OFFSET)
 
 #define ANDES_PMACFG_MTYP_OFFSET		2
-#define ANDES_PMACFG_MTYP_DEV_NOBUF		(0 << ANDES_PMACFG_MTYP_OFFSET)
 /* Memory, Non-cacheable, Bufferable */
 #define ANDES_PMACFG_MTYP_MEM_NON_CACHE_BUF	(3 << ANDES_PMACFG_MTYP_OFFSET)
 

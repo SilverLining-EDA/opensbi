@@ -10,7 +10,6 @@
 
 #include <libfdt.h>
 #include <libfdt_env.h>
-#include <sbi/sbi_console.h>
 #include <sbi/sbi_domain.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hartmask.h>
@@ -170,10 +169,25 @@ static int __fixup_disable_devices(void *fdt, int doff, int roff,
 
 void fdt_domain_fixup(void *fdt)
 {
-	u32 dcount;
+	u32 i, dcount;
 	int err, poffset, doffset;
 	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	struct __fixup_find_domain_offset_info fdo;
+
+	/* Remove the domain assignment DT property from CPU DT nodes */
+	poffset = fdt_path_offset(fdt, "/cpus");
+	if (poffset < 0)
+		return;
+	fdt_for_each_subnode(doffset, fdt, poffset) {
+		err = fdt_parse_hart_id(fdt, doffset, &i);
+		if (err)
+			continue;
+
+		if (!fdt_node_is_enabled(fdt, doffset))
+			continue;
+
+		fdt_nop_property(fdt, doffset, "opensbi-domain");
+	}
 
 	/* Skip device disable for root domain */
 	if (!dom->index)
@@ -223,9 +237,7 @@ skip_device_disable:
 	fdt_nop_node(fdt, poffset);
 }
 
-#define FDT_DOMAIN_REGION_MAX_COUNT		16
-#define FDT_ROOT_REGION_INHERIT_M_ONLY		0
-#define FDT_ROOT_REGION_INHERIT_ALL		1
+#define FDT_DOMAIN_REGION_MAX_COUNT	16
 
 struct parse_region_data {
 	struct sbi_domain *dom;
@@ -277,10 +289,8 @@ static int __fdt_parse_region(const void *fdt, int domain_offset,
 		return SBI_EINVAL;
 	order = val32;
 
-	flags = region_access & (SBI_DOMAIN_MEMREGION_ACCESS_MASK
-				| SBI_DOMAIN_MEMREGION_ENF_PERMISSIONS);
-
 	/* Read "mmio" DT property */
+	flags = region_access & SBI_DOMAIN_MEMREGION_ACCESS_MASK;
 	if (fdt_get_property(fdt, region_offset, "mmio", NULL))
 		flags |= SBI_DOMAIN_MEMREGION_MMIO;
 
@@ -297,13 +307,13 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 	u32 val32;
 	u64 val64;
 	const u32 *val;
-	const char *inherit;
 	struct sbi_domain *dom;
 	struct sbi_hartmask *mask;
+	struct sbi_hartmask assign_mask;
 	struct parse_region_data preg;
+	int *cold_domain_offset = opaque;
 	struct sbi_domain_memregion *reg;
-	int inheritance_mode = FDT_ROOT_REGION_INHERIT_M_ONLY;
-	int i, err = 0, len, cpu_offset;
+	int i, err = 0, len, cpus_offset, cpu_offset, doffset;
 
 	dom = sbi_zalloc(sizeof(*dom));
 	if (!dom)
@@ -329,14 +339,6 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 	strncpy(dom->name, fdt_get_name(fdt, domain_offset, NULL),
 		    sizeof(dom->name));
 	dom->name[sizeof(dom->name) - 1] = '\0';
-
-	/* Read initalization order */
-	val = fdt_getprop(fdt, domain_offset, "init-order", &len);
-	len = len / sizeof(u32);
-	if (val && len)
-		dom->init_order = fdt32_to_cpu(val[0]);
-	else
-		dom->init_order = (u32)domain_offset;
 
 	/* Setup possible HARTs mask */
 	SBI_HARTMASK_INIT(mask);
@@ -369,42 +371,20 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 	if (err)
 		goto fail_free_all;
 
-	/* Determine root domain regions inheritance behavior. */
-	inherit = fdt_getprop(fdt, domain_offset,
-			       "root-regions-inheritance", &len);
-	if (inherit && len > 0) {
-		if (!strcmp(inherit, "all"))
-			inheritance_mode = FDT_ROOT_REGION_INHERIT_ALL;
-		else if (!strcmp(inherit, "m-only"))
-			inheritance_mode = FDT_ROOT_REGION_INHERIT_M_ONLY;
-		else {
-			sbi_printf("%s: domain \"%s\" has unsupported "
-				   "root-regions-inheritance=\"%s\"\n",
-				   __func__, dom->name, inherit);
-			err = SBI_EINVAL;
-			goto fail_free_all;
-		}
-	}
-
-	/* Copy over root domain memregions according to inheritance_mode. */
+	/*
+	 * Copy over root domain memregions which don't allow
+	 * read, write and execute from lower privilege modes.
+	 *
+	 * These root domain memregions without read, write,
+	 * and execute permissions include:
+	 * 1) firmware region protecting the firmware memory
+	 * 2) mmio regions protecting M-mode only mmio devices
+	 */
 	sbi_domain_for_each_memregion(&root, reg) {
-		bool copy = false;
-
-		switch (inheritance_mode) {
-		case FDT_ROOT_REGION_INHERIT_ALL:
-			copy = true;
-			break;
-		case FDT_ROOT_REGION_INHERIT_M_ONLY:
-			if (SBI_DOMAIN_MEMREGION_IS_FIRMWARE(reg->flags) ||
-			    SBI_DOMAIN_MEMREGION_M_ONLY_ACCESS(reg->flags)) {
-				copy = true;
-			}
-			break;
-		}
-
-		if (!copy)
+		if ((reg->flags & SBI_DOMAIN_MEMREGION_SU_READABLE) ||
+		    (reg->flags & SBI_DOMAIN_MEMREGION_SU_WRITABLE) ||
+		    (reg->flags & SBI_DOMAIN_MEMREGION_SU_EXECUTABLE))
 			continue;
-
 		if (preg.max_regions <= preg.region_count) {
 			err = SBI_EINVAL;
 			goto fail_free_all;
@@ -414,13 +394,16 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 	dom->fw_region_inited = root.fw_region_inited;
 
 	/* Read "boot-hart" DT property */
-	val32 = current_hartid();
+	val32 = -1U;
 	val = fdt_getprop(fdt, domain_offset, "boot-hart", &len);
 	if (val && len >= 4) {
 		cpu_offset = fdt_node_offset_by_phandle(fdt,
 							 fdt32_to_cpu(*val));
 		if (cpu_offset >= 0 && fdt_node_is_enabled(fdt, cpu_offset))
 			fdt_parse_hart_id(fdt, cpu_offset, &val32);
+	} else {
+		if (domain_offset == *cold_domain_offset)
+			val32 = current_hartid();
 	}
 	dom->boot_hartid = val32;
 
@@ -431,7 +414,7 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 		val64 = fdt32_to_cpu(val[0]);
 		val64 = (val64 << 32) | fdt32_to_cpu(val[1]);
 	} else {
-		val64 = root.next_arg1;
+		val64 = sbi_scratch_thishart_ptr()->next_arg1;
 	}
 	dom->next_arg1 = val64;
 
@@ -442,7 +425,8 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 		val64 = fdt32_to_cpu(val[0]);
 		val64 = (val64 << 32) | fdt32_to_cpu(val[1]);
 	} else {
-		val64 = root.next_addr;
+		if (domain_offset == *cold_domain_offset)
+			val64 = sbi_scratch_thishart_ptr()->next_addr;
 	}
 	dom->next_addr = val64;
 
@@ -454,7 +438,8 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 		if (val32 != 0x0 && val32 != 0x1)
 			val32 = 0x1;
 	} else {
-		val32 = root.next_mode;
+		if (domain_offset == *cold_domain_offset)
+			val32 = sbi_scratch_thishart_ptr()->next_mode;
 	}
 	dom->next_mode = val32;
 
@@ -472,8 +457,44 @@ static int __fdt_parse_domain(const void *fdt, int domain_offset, void *opaque)
 	else
 		dom->system_suspend_allowed = false;
 
+	/* Find /cpus DT node */
+	cpus_offset = fdt_path_offset(fdt, "/cpus");
+	if (cpus_offset < 0) {
+		err = cpus_offset;
+		goto fail_free_all;
+	}
+
+	/* HART to domain assignment mask based on CPU DT nodes */
+	sbi_hartmask_clear_all(&assign_mask);
+	fdt_for_each_subnode(cpu_offset, fdt, cpus_offset) {
+		err = fdt_parse_hart_id(fdt, cpu_offset, &val32);
+		if (err)
+			continue;
+
+		if (SBI_HARTMASK_MAX_BITS <= val32)
+			continue;
+
+		if (!fdt_node_is_enabled(fdt, cpu_offset))
+			continue;
+
+		/* This is an optional property */
+		val = fdt_getprop(fdt, cpu_offset, "opensbi-domain", &len);
+		if (!val || len < 4)
+			continue;
+
+		/* However, it should be valid if specified */
+		doffset = fdt_node_offset_by_phandle(fdt, fdt32_to_cpu(*val));
+		if (doffset < 0) {
+			err = doffset;
+			goto fail_free_all;
+		}
+
+		if (doffset == domain_offset)
+			sbi_hartmask_set_hartid(val32, &assign_mask);
+	}
+
 	/* Register the domain */
-	err = sbi_domain_register(dom);
+	err = sbi_domain_register(dom, &assign_mask);
 	if (err)
 		goto fail_free_all;
 
@@ -490,10 +511,43 @@ fail_free_domain:
 
 int fdt_domains_populate(const void *fdt)
 {
+	const u32 *val;
+	int cold_domain_offset;
+	u32 hartid, cold_hartid;
+	int err, len, cpus_offset, cpu_offset;
+
 	/* Sanity checks */
 	if (!fdt)
 		return SBI_EINVAL;
 
+	/* Find /cpus DT node */
+	cpus_offset = fdt_path_offset(fdt, "/cpus");
+	if (cpus_offset < 0)
+		return cpus_offset;
+
+	/* Find coldboot HART domain DT node offset */
+	cold_domain_offset = -1;
+	cold_hartid = current_hartid();
+	fdt_for_each_subnode(cpu_offset, fdt, cpus_offset) {
+		err = fdt_parse_hart_id(fdt, cpu_offset, &hartid);
+		if (err)
+			continue;
+
+		if (hartid != cold_hartid)
+			continue;
+
+		if (!fdt_node_is_enabled(fdt, cpu_offset))
+			continue;
+
+		val = fdt_getprop(fdt, cpu_offset, "opensbi-domain", &len);
+		if (val && len >= 4)
+			cold_domain_offset = fdt_node_offset_by_phandle(fdt,
+							   fdt32_to_cpu(*val));
+
+		break;
+	}
+
 	/* Iterate over each domain in FDT and populate details */
-	return fdt_iterate_each_domain_ro(fdt, NULL, __fdt_parse_domain);
+	return fdt_iterate_each_domain_ro(fdt, &cold_domain_offset,
+					  __fdt_parse_domain);
 }

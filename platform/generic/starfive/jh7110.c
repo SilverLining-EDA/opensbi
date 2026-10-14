@@ -12,13 +12,12 @@
 #include <platform_override.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_bitops.h>
-#include <sbi/sbi_hart.h>
 #include <sbi/sbi_system.h>
 #include <sbi/sbi_console.h>
 #include <sbi/sbi_timer.h>
 #include <sbi/riscv_io.h>
-#include <sbi_utils/fdt/fdt_driver.h>
 #include <sbi_utils/fdt/fdt_helper.h>
+#include <sbi_utils/reset/fdt_reset.h>
 #include <sbi_utils/i2c/fdt_i2c.h>
 
 struct pmic {
@@ -283,27 +282,26 @@ err:
 	return rc;
 }
 
-static int starfive_jh7110_final_init(bool cold_boot)
+static int starfive_jh7110_final_init(bool cold_boot, void *fdt,
+				      const struct fdt_match *match)
 {
 	if (cold_boot) {
-		const void *fdt = fdt_get_address();
-
 		fdt_driver_init_one(fdt, starfive_jh7110_reset_drivers);
 	}
 
-	return generic_final_init(cold_boot);
+	return 0;
 }
 
-static bool starfive_jh7110_cold_boot_allowed(u32 hartid)
+static bool starfive_jh7110_cold_boot_allowed(u32 hartid,
+				   const struct fdt_match *match)
 {
 	if (selected_hartid != -1)
 		return (selected_hartid == hartid);
 
-	return generic_cold_boot_allowed(hartid);
+	return true;
 }
 
-static int starfive_jh7110_platform_init(const void *fdt, int nodeoff,
-					 const struct fdt_match *match)
+static void starfive_jh7110_fw_init(const void *fdt, const struct fdt_match *match)
 {
 	const fdt32_t *val;
 	int len, coff;
@@ -314,20 +312,16 @@ static int starfive_jh7110_platform_init(const void *fdt, int nodeoff,
 		if (val && len >= sizeof(fdt32_t))
 			selected_hartid = (u32) fdt32_to_cpu(*val);
 	}
-
-	generic_platform_ops.cold_boot_allowed = starfive_jh7110_cold_boot_allowed;
-	generic_platform_ops.final_init = starfive_jh7110_final_init;
-
-	return 0;
 }
 
 static const struct fdt_match starfive_jh7110_match[] = {
 	{ .compatible = "starfive,jh7110" },
-	{ .compatible = "starfive,jh7110s" },
 	{ },
 };
 
-const struct fdt_driver starfive_jh7110 = {
+const struct platform_override starfive_jh7110 = {
 	.match_table = starfive_jh7110_match,
-	.init = starfive_jh7110_platform_init,
+	.cold_boot_allowed = starfive_jh7110_cold_boot_allowed,
+	.fw_init = starfive_jh7110_fw_init,
+	.final_init = starfive_jh7110_final_init,
 };

@@ -14,9 +14,8 @@
 static int serial_uart8250_init(const void *fdt, int nodeoff,
 				const struct fdt_match *match)
 {
-	struct platform_uart_data uart = { 0 };
-	ulong caps = (ulong)match->data;
 	int rc;
+	struct platform_uart_data uart = { 0 };
 
 	rc = fdt_parse_uart_node(fdt, nodeoff, &uart);
 	if (rc)
@@ -24,15 +23,13 @@ static int serial_uart8250_init(const void *fdt, int nodeoff,
 
 	return uart8250_init(uart.addr, uart.freq, uart.baud,
 			     uart.reg_shift, uart.reg_io_width,
-			     uart.reg_offset, caps);
+			     uart.reg_offset);
 }
 
 static const struct fdt_match serial_uart8250_match[] = {
 	{ .compatible = "ns16550" },
 	{ .compatible = "ns16550a" },
 	{ .compatible = "snps,dw-apb-uart" },
-	{ .compatible = "intel,xscale-uart",
-	  .data = (void *)UART_CAP_UUE },
 	{ },
 };
 

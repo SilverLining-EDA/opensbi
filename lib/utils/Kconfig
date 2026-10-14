@@ -2,8 +2,6 @@
 
 menu "Utils and Drivers Support"
 
-source "$(OPENSBI_SRC_DIR)/lib/utils/cache/Kconfig"
-
 source "$(OPENSBI_SRC_DIR)/lib/utils/cppc/Kconfig"
 
 source "$(OPENSBI_SRC_DIR)/lib/utils/fdt/Kconfig"

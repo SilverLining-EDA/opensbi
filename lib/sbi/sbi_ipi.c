@@ -15,11 +15,9 @@
 #include <sbi/sbi_domain.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hart.h>
-#include <sbi/sbi_heap.h>
 #include <sbi/sbi_hsm.h>
 #include <sbi/sbi_init.h>
 #include <sbi/sbi_ipi.h>
-#include <sbi/sbi_list.h>
 #include <sbi/sbi_platform.h>
 #include <sbi/sbi_pmu.h>
 #include <sbi/sbi_string.h>
@@ -34,14 +32,8 @@ _Static_assert(
 	"type of sbi_ipi_data.ipi_type has changed, please redefine SBI_IPI_EVENT_MAX"
 	);
 
-struct sbi_ipi_device_node {
-	struct sbi_dlist head;
-	const struct sbi_ipi_device *dev;
-};
-
 static unsigned long ipi_data_off;
 static const struct sbi_ipi_device *ipi_dev = NULL;
-static SBI_LIST_HEAD(ipi_dev_node_list);
 static const struct sbi_ipi_event_ops *ipi_ops_array[SBI_IPI_EVENT_MAX];
 
 static int sbi_ipi_send(struct sbi_scratch *scratch, u32 remote_hartindex,
@@ -86,9 +78,13 @@ static int sbi_ipi_send(struct sbi_scratch *scratch, u32 remote_hartindex,
 	 * remote hart so call sbi_ipi_raw_send() only when
 	 * the ipi_type was previously zero.
 	 */
-	if (!__atomic_fetch_or(&ipi_data->ipi_type,
-				BIT(event), __ATOMIC_RELAXED))
-		ret = sbi_ipi_raw_send(remote_hartindex, false);
+	{
+		unsigned long old = ipi_data->ipi_type;
+
+		ipi_data->ipi_type = old | BIT(event);
+		if (!old)
+			ret = sbi_ipi_raw_send(remote_hartindex);
+	}
 
 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_IPI_SENT);
 
@@ -124,11 +120,6 @@ int sbi_ipi_send_many(ulong hmask, ulong hbase, u32 event, void *data)
 	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 
-	if (hmask == 0 && hbase != -1UL) {
-		/* Nothing to do, but it's not an error either. */
-		return 0;
-	}
-
 	/* Find the target harts */
 	rc = sbi_hsm_hart_interruptible_mask(dom, &target_mask);
 	if (rc)
@@ -136,22 +127,11 @@ int sbi_ipi_send_many(ulong hmask, ulong hbase, u32 event, void *data)
 
 	if (hbase != -1UL) {
 		struct sbi_hartmask tmp_mask = { 0 };
-		struct sbi_hartmask domain_mask;
-		int count = sbi_popcount(hmask);
 
 		for (i = hbase; hmask; i++, hmask >>= 1) {
 			if (hmask & 1UL)
 				sbi_hartmask_set_hartid(i, &tmp_mask);
 		}
-
-		/* Validate hartids against domain assignment, not HSM state */
-		rc = sbi_domain_get_assigned_hartmask(dom, &domain_mask);
-		if (rc)
-			return rc;
-
-		sbi_hartmask_and(&domain_mask, &domain_mask, &tmp_mask);
-		if (sbi_hartmask_weight(&domain_mask) != count)
-			return SBI_EINVAL;
 
 		sbi_hartmask_and(&target_mask, &target_mask, &tmp_mask);
 	}
@@ -263,7 +243,7 @@ void sbi_ipi_process(void)
 			sbi_scratch_offset_ptr(scratch, ipi_data_off);
 
 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_IPI_RECVD);
-	sbi_ipi_raw_clear(false);
+	sbi_ipi_raw_clear();
 
 	ipi_type = atomic_raw_xchg_ulong(&ipi_data->ipi_type, 0);
 	ipi_event = 0;
@@ -278,10 +258,8 @@ void sbi_ipi_process(void)
 	}
 }
 
-int sbi_ipi_raw_send(u32 hartindex, bool all_devices)
+int sbi_ipi_raw_send(u32 hartindex)
 {
-	struct sbi_ipi_device_node *entry;
-
 	if (!ipi_dev || !ipi_dev->ipi_send)
 		return SBI_EINVAL;
 
@@ -296,31 +274,14 @@ int sbi_ipi_raw_send(u32 hartindex, bool all_devices)
 	 */
 	wmb();
 
-	if (all_devices) {
-		sbi_list_for_each_entry(entry, &ipi_dev_node_list, head) {
-			if (entry->dev->ipi_send)
-				entry->dev->ipi_send(hartindex);
-		}
-	} else {
-		ipi_dev->ipi_send(hartindex);
-	}
-
+	ipi_dev->ipi_send(hartindex);
 	return 0;
 }
 
-void sbi_ipi_raw_clear(bool all_devices)
+void sbi_ipi_raw_clear(void)
 {
-	struct sbi_ipi_device_node *entry;
-
-	if (all_devices) {
-		sbi_list_for_each_entry(entry, &ipi_dev_node_list, head) {
-			if (entry->dev->ipi_clear)
-				entry->dev->ipi_clear();
-		}
-	} else {
-		if (ipi_dev && ipi_dev->ipi_clear)
-			ipi_dev->ipi_clear();
-	}
+	if (ipi_dev && ipi_dev->ipi_clear)
+		ipi_dev->ipi_clear();
 
 	/*
 	 * Ensure that memory or MMIO writes after this
@@ -339,22 +300,12 @@ const struct sbi_ipi_device *sbi_ipi_get_device(void)
 	return ipi_dev;
 }
 
-void sbi_ipi_add_device(const struct sbi_ipi_device *dev)
+void sbi_ipi_set_device(const struct sbi_ipi_device *dev)
 {
-	struct sbi_ipi_device_node *entry;
-
-	if (!dev)
+	if (!dev || ipi_dev)
 		return;
 
-	entry = sbi_zalloc(sizeof(*entry));
-	if (!entry)
-		return;
-	SBI_INIT_LIST_HEAD(&entry->head);
-	entry->dev = dev;
-	sbi_list_add_tail(&entry->head, &ipi_dev_node_list);
-
-	if (!ipi_dev || ipi_dev->rating < dev->rating)
-		ipi_dev = dev;
+	ipi_dev = dev;
 }
 
 int sbi_ipi_init(struct sbi_scratch *scratch, bool cold_boot)
@@ -374,6 +325,11 @@ int sbi_ipi_init(struct sbi_scratch *scratch, bool cold_boot)
 		if (ret < 0)
 			return ret;
 		ipi_halt_event = ret;
+
+		/* Initialize platform IPI support */
+		ret = sbi_platform_ipi_init(sbi_platform_ptr(scratch));
+		if (ret)
+			return ret;
 	} else {
 		if (!ipi_data_off)
 			return SBI_ENOMEM;
@@ -386,7 +342,7 @@ int sbi_ipi_init(struct sbi_scratch *scratch, bool cold_boot)
 	ipi_data->ipi_type = 0x00;
 
 	/* Clear any pending IPIs for the current hart */
-	sbi_ipi_raw_clear(true);
+	sbi_ipi_raw_clear();
 
 	/* Enable software interrupts */
 	csr_set(CSR_MIE, MIP_MSIP);

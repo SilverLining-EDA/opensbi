@@ -13,10 +13,8 @@
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_heap.h>
-#include <sbi/sbi_hfence.h>
 #include <sbi/sbi_scratch.h>
 #include <sbi/sbi_string.h>
-#include <sbi/sbi_tlb.h>
 #include <sbi/sbi_types.h>
 
 #include <sbi/riscv_asm.h>
@@ -160,16 +158,8 @@ static int fwft_get_double_trap(struct fwft_config *conf, unsigned long *value)
 
 static int fwft_adue_supported(struct fwft_config *conf)
 {
-	/*
-	 * FWFT.PTE_AD_HW_UPDATING is only supported when both Svade and Svadu
-	 * are supported. We need both in order to support toggling and to
-	 * ensure the reset value of zero is valid (it wouldn't be when only
-	 * Svadu is supported).
-	 */
 	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
-				    SBI_HART_EXT_SVADU) ||
-	    !sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
-				    SBI_HART_EXT_SVADE))
+				    SBI_HART_EXT_SVADU))
 		return SBI_ENOTSUPP;
 
 	return SBI_OK;
@@ -177,16 +167,7 @@ static int fwft_adue_supported(struct fwft_config *conf)
 
 static int fwft_set_adue(struct fwft_config *conf, unsigned long value)
 {
-	int res = fwft_menvcfg_set_bit(value, ENVCFG_ADUE_SHIFT);
-
-	if (res == SBI_OK) {
-		__sbi_sfence_vma_all();
-
-		if (misa_extension('H'))
-			__sbi_hfence_gvma_all();
-	}
-
-	return res;
+	return fwft_menvcfg_set_bit(value, ENVCFG_ADUE_SHIFT);
 }
 
 static int fwft_get_adue(struct fwft_config *conf, unsigned long *value)
@@ -242,32 +223,32 @@ static int fwft_pmlen_supported(struct fwft_config *conf)
 	return SBI_OK;
 }
 
+static bool fwft_try_to_set_pmm(unsigned long pmm)
+{
+	csr_set(CSR_MENVCFG, pmm);
+	return (csr_read(CSR_MENVCFG) & ENVCFG_PMM) == pmm;
+}
+
 static int fwft_set_pmlen(struct fwft_config *conf, unsigned long value)
 {
-	unsigned long pmm, prev;
+	unsigned long prev;
 
-	switch (value) {
-	case 0:
-		pmm = ENVCFG_PMM_PMLEN_0;
-		break;
-	case 7:
-		pmm = ENVCFG_PMM_PMLEN_7;
-		break;
-	case 16:
-		pmm = ENVCFG_PMM_PMLEN_16;
-		break;
-	default:
+	if (value > 16)
 		return SBI_EINVAL;
-	}
 
 	prev = csr_read_clear(CSR_MENVCFG, ENVCFG_PMM);
-	csr_set(CSR_MENVCFG, pmm);
-	if ((csr_read(CSR_MENVCFG) & ENVCFG_PMM) != pmm) {
-		csr_write(CSR_MENVCFG, prev);
-		return SBI_EINVAL;
+	if (value == 0)
+		return SBI_OK;
+	if (value <= 7) {
+		if (fwft_try_to_set_pmm(ENVCFG_PMM_PMLEN_7))
+			return SBI_OK;
+		csr_clear(CSR_MENVCFG, ENVCFG_PMM);
 	}
+	if (fwft_try_to_set_pmm(ENVCFG_PMM_PMLEN_16))
+		return SBI_OK;
+	csr_write(CSR_MENVCFG, prev);
 
-	return SBI_OK;
+	return SBI_EINVAL;
 }
 
 static int fwft_get_pmlen(struct fwft_config *conf, unsigned long *value)
@@ -356,7 +337,7 @@ int sbi_fwft_set(enum sbi_fwft_feature_t feature, unsigned long value,
 		return SBI_EINVAL;
 
 	if (conf->flags & SBI_FWFT_SET_FLAG_LOCK)
-		return SBI_EDENIED_LOCKED;
+		return SBI_EDENIED;
 
 	ret = conf->feature->set(conf, value);
 	if (ret)

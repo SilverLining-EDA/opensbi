@@ -46,13 +46,6 @@ static inline void sbi_ecall_console_puts(const char *str)
 		  sbi_strlen(str), (unsigned long)str, 0, 0, 0, 0);
 }
 
-static inline void sbi_ecall_shutdown(void)
-{
-	sbi_ecall(SBI_EXT_SRST, SBI_EXT_SRST_RESET,
-		  SBI_SRST_RESET_TYPE_SHUTDOWN, SBI_SRST_RESET_REASON_NONE,
-		  0, 0, 0, 0);
-}
-
 #define wfi()                                             \
 	do {                                              \
 		__asm__ __volatile__("wfi" ::: "memory"); \
@@ -61,6 +54,7 @@ static inline void sbi_ecall_shutdown(void)
 void test_main(unsigned long a0, unsigned long a1)
 {
 	sbi_ecall_console_puts("\nTest payload running\n");
-	sbi_ecall_shutdown();
-	sbi_ecall_console_puts("sbi_ecall_shutdown failed to execute.\n");
+
+	while (1)
+		wfi();
 }

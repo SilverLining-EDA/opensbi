@@ -61,7 +61,6 @@ static void plicsw_ipi_clear(void)
 
 static struct sbi_ipi_device plicsw_ipi = {
 	.name      = "andes_plicsw",
-	.rating    = 200,
 	.ipi_send  = plicsw_ipi_send,
 	.ipi_clear = plicsw_ipi_clear
 };
@@ -100,7 +99,7 @@ int plicsw_cold_ipi_init(struct plicsw_data *plicsw)
 	if (rc)
 		return rc;
 
-	sbi_ipi_add_device(&plicsw_ipi);
+	sbi_ipi_set_device(&plicsw_ipi);
 
 	return 0;
 }
